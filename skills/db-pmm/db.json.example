@@ -1,0 +1,10 @@
+{
+  "_說明": "複製成 db.json 並填入連線。db.json 含密碼，不要放進版控、不要隨 Skill 分享出去。",
+  "driver": "ODBC Driver 17 for SQL Server",
+  "host": "10.1.1.40",
+  "port": 1433,
+  "database": "RBMS",
+  "user": "請填唯讀帳號",
+  "password": "",
+  "trustServerCertificate": "yes"
+}

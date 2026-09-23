@@ -1,0 +1,4 @@
+interface:
+  display_name: "RoyalBase PMM"
+  short_description: "RoyalBase PMM 蝴蝶蘭產銷資料操作指南"
+  default_prompt: "Use $pmm to query, create, or update RoyalBase PMM records safely."

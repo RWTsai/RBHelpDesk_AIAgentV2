@@ -1,0 +1,36 @@
+# ===== 密鑰與連線設定（絕對不要進版控）=====
+.env
+!.env.example
+# Google service account 金鑰
+*.iam.gserviceaccount.com
+allusers-*.json
+*-service-account*.json
+# Skill 的資料庫連線（含密碼）；範本要保留
+db.json
+**/config/connection.json
+!db.json.example
+!**/connection.json.example
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# ===== 執行期產物 =====
+logs/
+*.log
+
+# ===== 作業系統與編輯器 =====
+Thumbs.db
+desktop.ini
+.DS_Store
+*.swp
+*~
+~$*
+.vscode/
+.idea/
