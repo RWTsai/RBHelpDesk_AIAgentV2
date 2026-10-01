@@ -314,6 +314,15 @@ feedback: 給 Agent 的修正建議
 - 開始處理時呼叫 LINE loading 動畫 API（`POST /v2/bot/chat/loading/start`）。
 - `reply_line_node.py` 在 reply token 失效（或處理時間超過 `LINE_PUSH_FALLBACK_SEC`）時改用 Push API（`/v2/bot/message/push`，對象為 state 中的 `user_id`）。
 
+### 4.6a Webhook 簽章驗證（v1.9 新增）
+
+`app.py` 的 webhook 在解析 JSON 之前先驗 `X-Line-Signature`：以 `LINE_CHANNEL_SECRET` 對**原始 body** 算 HMAC-SHA256、base64 後比對（`utils_line.verify_line_signature`，用 `hmac.compare_digest` 定時比對），不符就回 **403**，由 `LINE_VERIFY_SIGNATURE`（預設 `on`）控制。
+
+**為什麼是必要的**：這個 endpoint 必須對網際網路開放（LINE 平台要連得到）且沒有其他身分驗證，簽章是唯一能確認請求來自 LINE 的手段。缺少驗證時，任何知道網址的人都能偽造事件：**只要不帶 `replyToken`，回覆就會依 4.6 的規則改走 Push，推送到偽造事件自己指定的 `userId`**，等於把 QA 知識庫、文件庫與唯讀 SQL（180 張 PMM 表／檢視）變成對外服務。4.5「不依員工身分控管、全員可查範圍相同」這個決議的隱含前提就是「只有公司 LINE 的使用者進得來」，簽章沒驗則前提不成立。
+
+> 此驗證在改版前的 V1 不存在（`verify_line_signature()` 已寫好但 `app.py` 從未呼叫，V1 全部 commit 皆是），屬補強而非回歸。
+> 本機測試改用 `tools/post_webhook.py`（會用 `.env` 的 Channel Secret 自行算簽章），不開「驗證關閉」的後門。
+
 ### 4.7 延遲目標與快速路徑
 
 | 問題類型 | 目標（收到訊息 → 送出回覆） | 做法 |

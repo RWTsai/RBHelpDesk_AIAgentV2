@@ -211,6 +211,9 @@ ARTIFICIAL_TIMEOUT_MINUTES = _env_int("ARTIFICIAL_TIMEOUT_MINUTES", 15)
 # --- LINE ---
 LINE_CHANNEL_TOKEN = os.getenv("LINE_CHANNEL_TOKEN")
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
+# Webhook 簽章驗證。預設開啟，只有在本機測試且主機不對外時才可關閉——
+# 關掉等於讓任何人都能偽造 LINE 事件查內部知識庫（本機測試請改用 tools/post_webhook.py，它會自己算簽章）
+LINE_VERIFY_SIGNATURE = _env_bool("LINE_VERIFY_SIGNATURE", True)
 LINE_PUSH_FALLBACK_SEC = _env_int("LINE_PUSH_FALLBACK_SEC", 50)  # 處理超過此秒數改用 Push API
 LINE_LOADING_SECONDS = _env_int("LINE_LOADING_SECONDS", 30)      # loading 動畫秒數（5 的倍數，最多 60）
 

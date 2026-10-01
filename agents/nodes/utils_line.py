@@ -74,7 +74,8 @@ def verify_line_signature(body: bytes, signature: str) -> bool:
 
         computed_signature = base64.b64encode(hash_value).decode("utf-8")
 
-        return computed_signature == signature
+        # 用 compare_digest 做定時比對，避免字串比對的時間差被用來推測簽章
+        return hmac.compare_digest(computed_signature, signature)
 
     except Exception as e:
         log_error(f"LINE signature 驗證失敗: {e}")

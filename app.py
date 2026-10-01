@@ -28,7 +28,8 @@ import sys
 
 # 載入 LangGraph 的主流程（你已經建立在 agents/graph_main.py）
 from agents.graph_main import run_graph_for_line_event
-from config import print_config_status
+from agents.nodes.utils_line import verify_line_signature
+from config import print_config_status, LINE_VERIFY_SIGNATURE
 from database import doc_graph_client
 
 
@@ -100,6 +101,17 @@ def line_webhook():
     # request.json = payload
 
     print("[Webhook] 收到請求")
+
+    # ---- 驗證 X-Line-Signature ----
+    # 這個 endpoint 對網際網路開放（LINE 平台要連得到），沒有其他身分驗證，
+    # 所以簽章是唯一能確認「請求真的來自 LINE」的手段。少了它，任何人都能偽造
+    # 事件讓機器人查內部知識庫與資料庫，再把答案 push 到自己填的 userId。
+    # 必須在 get_json() 之前讀原始 body（get_data 會快取，之後 get_json 仍可用）。
+    if LINE_VERIFY_SIGNATURE:
+        raw_body = request.get_data()
+        if not verify_line_signature(raw_body, request.headers.get("X-Line-Signature", "")):
+            print("[Webhook] 簽章驗證失敗，拒絕請求")
+            return "invalid signature", 403
 
     ## 正式接收請求時使用下面這段程式碼
     try:
