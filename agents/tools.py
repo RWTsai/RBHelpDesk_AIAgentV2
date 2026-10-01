@@ -86,9 +86,20 @@ def search_qa_kb(query: str) -> dict:
             if top_sim >= RAG_MIN_SCORE and r["RowID"] not in rows:
                 rows[r["RowID"]] = dict(r, similarity=top_sim * 0.9)
 
-    # 同一段 ChunkText（同一筆 QA）的多個三元組合併成一個 item
+    items = qa_items(rows.values())
+    return {"ok": True, "items": items, "note": "" if items else "QA 知識庫沒有找到相關資料"}
+
+
+def qa_items(rows, min_score: float = 0.0, top_k: int = None) -> list:
+    """
+    QA 命中列（RowID／ChunkText／三元組／similarity）→ 統一的 items 格式。
+    同一段 ChunkText（同一筆 QA）的多個三元組合併成一個 item。
+    agent_node 的快速路徑檢查也用這支，避免兩邊格式走鐘。
+    """
     groups = {}
-    for r in sorted(rows.values(), key=lambda x: x.get("similarity", 0), reverse=True):
+    for r in sorted(rows, key=lambda x: x.get("similarity", 0), reverse=True):
+        if r.get("similarity", 0) < min_score:
+            continue
         key = (r.get("ChunkText") or "").strip()
         if not key:
             continue
@@ -97,7 +108,7 @@ def search_qa_kb(query: str) -> dict:
             g["triples"].append(f"{r['Entity1']} {r['Relation']} {r['Entity2']}")
 
     items = []
-    for text, g in list(groups.items())[: RAG_QA_TOP_K + 1]:
+    for text, g in list(groups.items())[: (top_k or RAG_QA_TOP_K) + 1]:
         body = text
         if g["triples"]:
             body += "\n[相關三元組] " + "；".join(dict.fromkeys(g["triples"]))
@@ -108,8 +119,7 @@ def search_qa_kb(query: str) -> dict:
             "text": body,
             "score": round(g["score"], 4),
         })
-
-    return {"ok": True, "items": items, "note": "" if items else "QA 知識庫沒有找到相關資料"}
+    return items
 
 
 # =====================================================
@@ -541,6 +551,23 @@ def validate_sql(sql: str, source: str = None):
     return True, stmt.sql(dialect="tsql"), sorted(set(tables))
 
 
+def _probe_limit(sql: str):
+    """
+    把 TOP N 改成 TOP N+1，回傳 (探測用的 SQL, 原本的筆數上限 N)。
+    多抓的那一筆不回傳給模型，只用來判斷「是不是還有更多資料」——
+    否則剛好 N 筆和超過 N 筆長得一樣，模型會把截斷的結果當成全部。
+    """
+    try:
+        stmt = sqlglot.parse_one(sql, dialect="tsql")
+        limit = stmt.args.get("limit")
+        if limit is not None:
+            n = int(limit.expression.this)
+            return stmt.limit(n + 1).sql(dialect="tsql"), n
+    except Exception:
+        pass
+    return sql, SQL_MAX_ROWS
+
+
 def _json_value(v):
     if isinstance(v, (datetime.datetime, datetime.date, datetime.time)):
         return v.isoformat()
@@ -561,14 +588,17 @@ def sql_query(sql: str, source: str = None) -> dict:
         log_error(f"[tools.sql_query] 拒絕執行（{src}）：{result}｜SQL={sql}")
         return {"ok": False, "items": [], "rejected": True, "note": f"SQL 被拒絕：{result}", "sql": sql, "source": src}
 
-    run_sql = result
+    run_sql, cap = _probe_limit(result)     # 多抓一筆，用來判斷有沒有被截斷（cap = 原本的上限）
     log_info(f"[tools.sql_query] 執行（{src}）：{run_sql}")
     with pyodbc.connect(sql_sources()[src]["conn"], timeout=SQL_TIMEOUT_SEC) as conn:
         conn.timeout = SQL_TIMEOUT_SEC  # 查詢逾時（秒）
         cursor = conn.cursor()
         cursor.execute(run_sql)
         cols = [c[0] for c in cursor.description]
-        rows = [[_json_value(v) for v in r] for r in cursor.fetchmany(SQL_MAX_ROWS)]
+        fetched = cursor.fetchmany(cap + 1)
+
+    truncated = len(fetched) > cap          # 多抓到第 cap+1 筆＝還有更多
+    rows = [[_json_value(v) for v in r] for r in fetched[:cap]]
 
     # 轉成 Markdown 表格給 LLM 讀
     lines = ["| " + " | ".join(cols) + " |", "|" + "---|" * len(cols)]
@@ -585,8 +615,28 @@ def sql_query(sql: str, source: str = None) -> dict:
             "title": f"{src} 資料庫查詢（{', '.join(tables)}）",
             "text": "\n".join(lines) if rows else "（查無資料）",
         }],
-        "note": "" if rows else "查詢成功，但沒有符合條件的資料",
+        "note": _sql_note(rows, truncated, cap),
     }
+
+
+def _sql_note(rows, truncated, cap) -> str:
+    if not rows:
+        return "查詢成功，但沒有符合條件的資料"
+    if not truncated:
+        return ""
+    note = (
+        f"結果已截斷：只回傳前 {cap} 筆，實際資料比這更多。"
+        f"回答時必須告訴使用者這是前 {cap} 筆、不是全部。"
+    )
+    if cap >= SQL_MAX_ROWS:
+        return note + (
+            f"工具上限固定為 {SQL_MAX_ROWS} 筆，把 TOP 改大也不會變多；"
+            f"要知道總數請改用 COUNT()／GROUP BY 彙總，或加條件縮小範圍後重查。"
+        )
+    return note + (
+        f"這是你 SQL 裡 TOP {cap} 的限制，最多可以放寬到 {SQL_MAX_ROWS} 筆；"
+        f"要知道總數請改用 COUNT()／GROUP BY 彙總。"
+    )
 
 
 # 白名單各表欄位（從唯讀連線讀 INFORMATION_SCHEMA，快取 10 分鐘）

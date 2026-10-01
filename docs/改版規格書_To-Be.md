@@ -257,11 +257,13 @@ Router=text
 ### 4.2 工具使用規則（`config.py :: AGENT_SYSTEM_PROMPT`）
 
 1. 內部問題先查內部：`search_qa_kb` → `search_documents`（必要時 `explore_entity` 追關係）。
-2. 內部查不到，或明顯需要外部／最新資訊時，才使用 `web_search`；回覆要標明來自網路。
-3. 需要即時資料（例如帳號狀態）時使用 `sql_query`（可查的表與欄位說明已寫在工具描述中，不必先載入 Skill）。
-4. 同樣的查詢不重複呼叫；證據足夠就停止查詢並作答。
-5. 符合某個 Skill 的描述時，先 `load_skill` 再依其指示處理。
-6. 內部系統資訊只能依據工具取得的證據，不得捏造。
+2. **`search_qa_kb` 的結果不足以完整回答時，一定要再呼叫 `search_documents`**（v1.9 補強）。沒命中、只是題目相近、只查到結論而缺少操作步驟／畫面位置／設定值，或問的是某系統的操作方式與流程，都算不足——這類完整說明通常寫在手冊或簡報裡，QA 知識庫往往只有摘要。
+3. 內部查不到，或明顯需要外部／最新資訊時，才使用 `web_search`；回覆要標明來自網路。
+4. 需要即時資料（例如帳號狀態）時使用 `sql_query`（可查的表與欄位說明已寫在工具描述中，不必先載入 Skill）。
+5. 同樣的查詢不重複呼叫；證據足夠就停止查詢並作答。
+6. 符合某個 Skill 的描述時，先 `load_skill` 再依其指示處理。
+7. 內部系統資訊只能依據工具取得的證據，不得捏造。
+8. 非繁體中文提問時，查詢先轉繁體中文關鍵字，回覆用使用者的語言。
 
 ### 4.3 驗證器 `verify()`
 
@@ -298,14 +300,14 @@ feedback: 給 Agent 的修正建議
 | 1. DB 權限 | 只用各來源的 `SQL_<名稱>_CONN`，帳號只有白名單表的 SELECT 權限 |
 | 2. 語法檢查 | `sqlglot`（tsql 方言）解析：只允許**單一 SELECT**；拒絕 INSERT／UPDATE／DELETE／MERGE／EXEC／DROP／ALTER／`SELECT INTO`／`OPENROWSET`／`OPENQUERY`／多語句 |
 | 3. 表白名單 | 只能查該來源白名單內的表／檢視（解析出的每個表名都要在內）；`@skill`／`*` 兩種來源仍由 `.env` 決定是否採用，且一律再扣掉 `DENY_TABLES`；來源之間不共用白名單、不能互相 JOIN |
-| 4. 結果限制 | 自動加上 `TOP {SQL_MAX_ROWS}`、查詢逾時 `SQL_TIMEOUT_SEC` |
+| 4. 結果限制 | 自動加上 `TOP {SQL_MAX_ROWS}`、查詢逾時 `SQL_TIMEOUT_SEC`。實際執行時會多抓一筆（`TOP N+1`，v1.9），多出來的不回傳，只用來判斷有沒有被截斷；被截斷時 `note` 會明確告知「這是前 N 筆、不是全部，上限無法提高，要總數請用 COUNT()／GROUP BY」，避免模型把截斷結果當成完整清單，或承諾使用者做不到的完整匯出 |
 | 5. 稽核 | 每句 SQL（含被拒絕的）記錄到 `IT_KB_AgentTrace` |
 
 - **不依員工身分控管**：所有 LINE 使用者可查的範圍相同，因此各來源的白名單只應放入允許全員查看的表／檢視；含個資、薪資等敏感欄位的表建議改建檢視（只露出可公開欄位）再列入白名單。
 - **表結構說明**：白名單在 `SQL_SCHEMA_INLINE_MAX` 張以內時，啟動時由唯讀連線讀取各表欄位（`INFORMATION_SCHEMA.COLUMNS`）寫進 `sql_query` 的工具描述；超過時只列表名，改註冊 `describe_table(table)` 工具讓模型寫 SQL 前現查欄位（快取），避免上百張表的欄位清單每次請求都塞進提示詞。兩種情況都會把 `skills/db-query/SKILL.md` 的表意義、關聯與撰寫規則併入工具描述。
 - **設定跟著 Skill 走**：Skill 會被分享、也可能從外部取得，IT 不一定知道它要用哪些表、連哪個庫，因此連線（`skills/<名>/db.json`，另附 `db.json.example`）與表清單（SKILL.md 的 `db:`／`tables:`）都放在 Skill 資料夾內，丟進 `skills/` 就生效、改 `db.json` 即換連線，**`.env` 不用動**。`.env` 只剩兩種用途：`SQL_<名稱>_DENY_TABLES` 擋表，以及 `SQL_SOURCES`＋`SQL_<名稱>_CONN/TABLES` 由 IT 接管（同名時 `.env` 優先）；也可以寫 `*` 讓唯讀帳號的 SELECT 權限直接決定範圍。兩種情況的**開關仍在 `.env`**，且 `DENY_TABLES` 與 DB 權限仍是後兩道防線。服務啟動時會列出每個來源綁到哪些 Skill、設定來自哪裡、缺哪幾張表，以及「要查資料庫但沒有連線設定」的 Skill（裝外來 Skill 最常見）；AI 查到被擋的表，訊息也會提示請 IT 加入。
 - **多資料庫**：每個資料庫是一個具名來源，`sql_query(sql, source)`／`describe_table(table, source)` 用 `source` 指定；只有一個來源時可省略。新增資料庫只要在 `.env` 加 `SQL_SOURCES` 名稱與四個參數，再寫一份 `skills/db-<名稱>/SKILL.md`，**不用改程式**。Skill 的 `tool.py` 要連資料庫時用 `config.get_sql_source("<名稱>")` 取連線，不得自行保存帳密。
-- **預設白名單**：`skills/db-pmm/SKILL.md` 宣告的 129 張 PMM 表／檢視（DB `RBMS`，整理自 PMM Skill 文件）。該檔本文同時寫入表的中文意義、單頭／單身與配貨／出貨關聯；`skills/db-query/SKILL.md` 則是各來源共通的撰寫規則。不想開放的表（例如 `BIPersonel`、`BSRole`、`PersonelPermission` 等帳號權限相關）填到 `SQL_PMM_DENY_TABLES` 即可。
+- **預設白名單**：`skills/db-pmm/SKILL.md` 宣告的 129 張 PMM 表／檢視（DB `RBMS`，整理自 PMM Skill 文件）。該檔本文同時寫入表的中文意義、單頭／單身與配貨／出貨關聯；`skills/db-query/SKILL.md` 則是各來源共通的撰寫規則。不想開放的表（例如 `BIPersonel`、`BSRole`、`View_PersonelPermission` 等帳號權限相關）填到 `SQL_PMM_DENY_TABLES` 即可。
 
 ### 4.6 LINE 回覆時效
 
@@ -319,6 +321,8 @@ feedback: 給 Agent 的修正建議
 | 一般 QA 知識庫檢索 | **< 5 秒** | 快速路徑：問題直接 embedding（不做三元組抽取）→ 查記憶體快取 → 分數 ≥ `QA_FAST_PATH_MIN_SCORE` 就一次呼叫主模型作答，不跑迴圈、不驗證（約 1 次 embedding＋1 次 LLM） |
 | 唯讀 SQL 查詢 | **< 5 秒** | 工具描述已含表結構（不需 `load_skill`）→ 第 1 輪產生 SQL → 執行 → 第 2 輪作答，不驗證（約 2 次 LLM＋1 次查詢） |
 | 文件檢索、多步查詢、網路搜尋 | 可較久（預估 10–30 秒） | 完整 Agent 迴圈＋驗證器；超過 `LINE_PUSH_FALLBACK_SEC` 改用 Push |
+
+快速路徑沒過門檻時（v1.9 補強）：那批 QA 命中**不丟掉**，直接當成「已呼叫過 `search_qa_kb`」的證據帶進 Agent 迴圈（分數 ≥ `QA_PREFETCH_MIN_SCORE`，預設 0.50；低於此視為雜訊不帶入，例如問安）。理由：向量檢索已經跑完等於免費，可省掉一次工具往返，也避免分數落在 0.5～0.8 這個「QA 有料但不夠高分」的區間時，模型完全不查就憑自身知識作答。帶入後會計入 `tools_used`，因此驗證器照樣檢查這批證據。
 
 其他加速措施：
 - 主控模型以 `AGENT_REASONING_EFFORT`（預設 `low`）呼叫，減少推理時間。
@@ -489,4 +493,4 @@ IT 人員新增 `skills/printer-setup/SKILL.md`（＋`tool.py` 查印表機清�
 7. **.NET 後台**：發佈 RBITQAContent（新增「文件管理」選單；`appsettings.json` 已加入 `OpenAI:*`、`DocUpload:*`；`web.config` 已放寬 IIS 上傳大小）。
 8. **回退**：`.env` 設 `AGENT_MODE=off` 並重啟 `app.py`，即退回改版前的固定管線。
 
-> 本規格書為改版（To-Be）方案 v1.2，已納入第 10 章的回覆與 OneDrive 來源。審核通過後即依第 9 章順序開始實作。
+> 本規格書為改版（To-Be）方案 v1.9，已納入第 10 章的回覆與 OneDrive 來源。審核通過後即依第 9 章順序開始實作。

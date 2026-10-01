@@ -35,6 +35,7 @@ from config import (
     AGENT_MAX_VERIFY_RETRY,
     AGENT_FAST_PATH,
     QA_FAST_PATH_MIN_SCORE,
+    QA_PREFETCH_MIN_SCORE,
     VERIFY_ENABLED,
     VERIFY_EVIDENCE_MAX_CHARS,
     SYSROLE_PROMPT,
@@ -101,14 +102,15 @@ def process_text(state: dict) -> dict:
         _step(trace, "skill_keyword", 0, skills=[s["name"] for s in kw_skills])
 
     reply, sources = None, []
+    qa_hits = []               # 快速路徑查到的 QA 命中；分數不夠時轉給 Agent 迴圈當證據
     try:
         # ---------- 1) 快速路徑 ----------
         if AGENT_FAST_PATH:
-            reply = _fast_path(question, history, skill_text, trace)
+            reply, qa_hits = _fast_path(question, history, skill_text, trace)
 
         # ---------- 2) Agent 迴圈 + 3) 驗證 ----------
         if reply is None:
-            reply, sources = _agent_loop(question, history, kw_skills, skill_text, trace)
+            reply, sources = _agent_loop(question, history, kw_skills, skill_text, trace, qa_hits)
 
     except Exception as e:
         log_error(f"[AGENT] 執行失敗：{e}")
@@ -138,7 +140,8 @@ def _fast_path(question, history, skill_text, trace):
     top = hits[0]["similarity"] if hits else 0.0
     _step(trace, "fast_path_check", t, top_score=round(top, 4), threshold=QA_FAST_PATH_MIN_SCORE)
     if top < QA_FAST_PATH_MIN_SCORE:
-        return None
+        # 分數不夠走不了快速路徑，但這批命中已經查好了，交給 Agent 迴圈當預先證據，不要重查
+        return None, hits
 
     # 只取夠接近的命中（與 top1 差距 0.1 以內），依 ChunkText 去重
     chunks, triples = [], []
@@ -171,13 +174,13 @@ def _fast_path(question, history, skill_text, trace):
     )
     _step(trace, "fast_path_answer", t, model=OPENAI_MODEL_FAST)
     trace["verdict"] = "fast_path"
-    return res.choices[0].message.content or ""
+    return res.choices[0].message.content or "", hits
 
 
 # =====================================================
 # 2) Agent 迴圈
 # =====================================================
-def _agent_loop(question, history, kw_skills, skill_text, trace):
+def _agent_loop(question, history, kw_skills, skill_text, trace, qa_hits=()):
     registry = agent_tools.build_base_tools()
     loaded_skills = {s["name"] for s in kw_skills}
     # 已注入的 skill 若帶工具，直接加進可用工具
@@ -201,6 +204,22 @@ def _agent_loop(question, history, kw_skills, skill_text, trace):
 
     evidence = {}      # source_id → item（去重後的全部證據）
     tools_used = []    # 依序記錄用過的工具名稱
+
+    # 快速路徑已經查過 QA 知識庫（分數不夠才會走到這裡），把命中結果直接當成證據帶進來：
+    # 向量搜尋已經跑完是免費的，省掉一次 search_qa_kb 往返，也避免模型完全不查就憑自身知識作答
+    prefetch = agent_tools.qa_items(qa_hits, min_score=QA_PREFETCH_MIN_SCORE)
+    if prefetch:
+        for it in prefetch:
+            evidence[it["source_id"]] = it
+        tools_used.append("search_qa_kb")      # 讓驗證器照樣檢查這批證據
+        messages.append({"role": "user", "content": (
+            "[系統訊息，使用者看不到] 已經先幫你查過 QA 知識庫（等同 search_qa_kb），結果如下，"
+            "不要重複呼叫 search_qa_kb：\n"
+            + agent_tools.result_to_text({"ok": True, "items": prefetch})
+            + "\n若這些內容不足以完整回答使用者的問題，請依工具使用規則第 2 條呼叫 search_documents。"
+        )})
+        _step(trace, "qa_prefetch", 0, items=len(prefetch), top_score=prefetch[0]["score"])
+
     steps = 0
     verify_retry = 0
     draft = None

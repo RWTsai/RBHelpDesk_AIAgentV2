@@ -78,6 +78,9 @@ AGENT_MAX_VERIFY_RETRY = _env_int("AGENT_MAX_VERIFY_RETRY", 1)  # 驗證 needs_m
 AGENT_TOOL_RESULT_MAX_CHARS = _env_int("AGENT_TOOL_RESULT_MAX_CHARS", 4000)
 AGENT_FAST_PATH = _env_bool("AGENT_FAST_PATH", True)
 QA_FAST_PATH_MIN_SCORE = _env_float("QA_FAST_PATH_MIN_SCORE", 0.80)
+# 快速路徑分數不夠時，這批 QA 命中仍當成「已查過」的證據帶進 Agent 迴圈；
+# 低於此分數視為雜訊不帶入（例如問安），設 0 則一律帶入
+QA_PREFETCH_MIN_SCORE = _env_float("QA_PREFETCH_MIN_SCORE", 0.50)
 QA_TRIPLE_EXPAND = _env_bool("QA_TRIPLE_EXPAND", True)        # search_qa_kb 是否先做三元組擴展
 VERIFY_ENABLED = _env_bool("VERIFY_ENABLED", True)
 VERIFY_EVIDENCE_MAX_CHARS = _env_int("VERIFY_EVIDENCE_MAX_CHARS", 12000)
@@ -338,12 +341,17 @@ AGENT_SYSTEM_PROMPT = """
 
 【工具使用規則】
 1. 公司內部問題先查內部：search_qa_kb（QA 知識庫）→ search_documents（SOP、手冊等文件）；需要追查某個系統／設備的關聯時用 explore_entity。
-2. 內部查不到，或明顯需要外部、最新資訊（例如軟體版本、公開的錯誤碼說明）時，才用 web_search；回答時要說明資訊來自網路。
-3. 需要即時資料（例如帳號狀態）時用 sql_query；只能寫單一 SELECT，只能查工具說明中列出的表。
-4. 同樣的查詢不要重複呼叫；證據足夠就停止查詢並作答。問安、閒聊、範圍外的問題不需要呼叫工具。
-5. 問題符合下方某個 Skill 的描述時，先呼叫 load_skill 取得作法再處理（已直接提供內容的 Skill 不必再載入）。
-6. 公司內部系統、流程、帳號的資訊只能依據工具取得的證據，不得捏造；一般 IT 常識可以用你自己的知識補充。
-7. 使用者不是用繁體中文發問時，查詢時先轉成繁體中文關鍵字，回答時用使用者的語言。
+2. **search_qa_kb 的結果不足以完整回答時，一定要再呼叫 search_documents**。以下任一情況都算不足，不可以只憑 QA 知識庫就作答：
+   - 沒有命中，或命中的內容只是題目相近，並沒有回答到使用者問的那件事
+   - 只查到結論或名詞解釋，缺少使用者要的操作步驟、畫面位置、設定值
+   - 使用者問的是某個系統的操作方式、設定或流程（這類完整說明通常在手冊、簡報裡，QA 知識庫往往只有摘要）
+   反之，QA 知識庫已經完整回答了問題，就不必再查文件。
+3. 內部查不到，或明顯需要外部、最新資訊（例如軟體版本、公開的錯誤碼說明）時，才用 web_search；回答時要說明資訊來自網路。
+4. 需要即時資料（例如帳號狀態）時用 sql_query；只能寫單一 SELECT，只能查工具說明中列出的表。
+5. 同樣的查詢不要重複呼叫；證據足夠就停止查詢並作答。問安、閒聊、範圍外的問題不需要呼叫工具。
+6. 問題符合下方某個 Skill 的描述時，先呼叫 load_skill 取得作法再處理（已直接提供內容的 Skill 不必再載入）。
+7. 公司內部系統、流程、帳號的資訊只能依據工具取得的證據，不得捏造；一般 IT 常識可以用你自己的知識補充。
+8. 使用者不是用繁體中文發問時，查詢時先轉成繁體中文關鍵字，回答時用使用者的語言。
 
 【引用來源】
 回答的最後一行固定輸出「SOURCES: 」加上你實際引用的來源編號（工具結果中的 source_id，例如 DOC-12, WEB-3），以逗號分隔；沒有引用任何來源時輸出「SOURCES: 無」。這一行系統會自動移除，使用者看不到。

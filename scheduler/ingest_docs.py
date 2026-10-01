@@ -87,6 +87,66 @@ def _tokens(text: str) -> int:
     return len(ENC.encode(text or "", disallowed_special=()))
 
 
+# --- 資料庫連線診斷（連不上時給一句人看得懂的話，而不是一整串 traceback）---
+# 用 SQL Server 錯誤碼／SQLSTATE 判斷，不用訊息文字：ODBC 的訊息會跟著作業系統語言變。
+# 訊息裡的 SQL Server 錯誤碼 → (原因, 要檢查什麼)
+# 依序比對，較精確的放前面：資料庫開不起來時訊息會同時出現 4060 和 18456
+_DB_CODE_HINTS = (
+    ("4060", "資料庫名稱錯誤，或這個帳號沒有該資料庫的權限", "檢查 MSSQL_CONN 的 DATABASE，以及該帳號在這個資料庫的權限"),
+    ("40615", "防火牆未放行這台主機的 IP", "在資料庫端的防火牆規則加入這台主機的 IP"),
+    ("18452", "帳號不被信任（可能誤用 Windows 驗證）", "檢查 MSSQL_CONN 是否該用 UID／PWD 或 Trusted_Connection=yes"),
+    ("18456", "帳號或密碼不正確", "檢查 .env 的 MSSQL_CONN 裡的 UID／PWD"),
+)
+# SQLSTATE → (原因, 要檢查什麼)
+_DB_STATE_HINTS = {
+    "28000": ("登入失敗", "檢查 .env 的 MSSQL_CONN 裡的 UID／PWD"),
+    "08001": ("連不到資料庫主機", "檢查 MSSQL_CONN 的 SERVER（主機名稱、實例名、連接埠）與網路／防火牆，並確認 SQL Server 已開啟 TCP/IP"),
+    "08S01": ("與資料庫的連線中斷", "確認資料庫主機與網路狀態"),
+    "08004": ("資料庫拒絕連線", "檢查 MSSQL_CONN 的 DATABASE 與該帳號的權限"),
+    "HYT00": ("連線逾時", "確認資料庫主機是否開機、網路是否可達"),
+    "HYT01": ("連線逾時", "確認資料庫主機是否開機、網路是否可達"),
+    "IM002": ("ODBC 驅動程式名稱不對或未安裝", "檢查 MSSQL_CONN 的 DRIVER，並確認主機已安裝 ODBC Driver for SQL Server"),
+    "IM003": ("ODBC 驅動程式無法載入", "重新安裝 Microsoft ODBC Driver 17／18 for SQL Server"),
+    "42000": ("資料庫名稱錯誤，或這個帳號沒有該資料庫的權限", "檢查 MSSQL_CONN 的 DATABASE，以及該帳號在這個資料庫的權限"),
+}
+
+
+def _db_error_lines(e) -> list:
+    """把 pyodbc 的錯誤轉成「原因／請檢查／詳細」三行；認不出來就只印原始訊息。"""
+    raw = mask_secrets(str(e))
+    hint = None
+
+    # 1) 先看 SQL Server 錯誤碼（比 SQLSTATE 精確）
+    for code, cause, action in _DB_CODE_HINTS:
+        if f"({code})" in raw or f"[{code}]" in raw:
+            hint = (cause, action)
+            break
+
+    # 2) 再看 SQLSTATE（pyodbc 放在 args[0]）
+    if hint is None:
+        args = getattr(e, "args", ())
+        state = args[0].upper() if args and isinstance(args[0], str) else ""
+        hint = _DB_STATE_HINTS.get(state)
+
+    detail = raw if len(raw) <= 300 else raw[:300] + "…"
+    if hint is None:
+        return [f"原因：{detail}", "請檢查：.env 的 MSSQL_CONN 設定與資料庫主機狀態"]
+    return [f"原因：{hint[0]}", f"請檢查：{hint[1]}", f"詳細：{detail}"]
+
+
+def check_db() -> bool:
+    """開工前先確認資料庫連得上。連不上就印出原因並回 False（不丟 traceback）。"""
+    try:
+        with get_mssql_conn() as conn:
+            conn.cursor().execute("SELECT 1").fetchone()
+        return True
+    except Exception as e:
+        log_error("[ingest] 資料庫連線失敗，這一輪不執行")
+        for line in _db_error_lines(e):
+            log_error(f"[ingest] {line}")
+        return False
+
+
 # =====================================================
 # 1. 解析：bytes → [(章節路徑, 文字)]
 # =====================================================
@@ -1058,8 +1118,11 @@ def run_once():
             fn()
         except Exception as e:
             log_error(f"[ingest] {name} 收件失敗：{e}")
-    process_deleting()
-    process_pending()
+    for name, fn in (("刪除", process_deleting), ("匯入", process_pending)):
+        try:
+            fn()
+        except Exception as e:
+            log_error(f"[ingest] {name}階段失敗：{mask_secrets(str(e))}")
 
 
 if __name__ == "__main__":
@@ -1069,13 +1132,23 @@ if __name__ == "__main__":
     parser.add_argument("--doc", type=int, help="只重新處理指定 DocumentID")
     args = parser.parse_args()
 
+    if args.loop:
+        # 常駐模式：資料庫暫時掛掉不要讓程序死掉，下一輪再試
+        log_info(f"[ingest] 常駐模式，每 {INGEST_INTERVAL_SEC} 秒一輪")
+        started = False
+        while True:
+            if check_db():
+                if not started:
+                    reset_stuck()
+                    started = True
+                run_once()
+            time.sleep(INGEST_INTERVAL_SEC)
+
+    # 單次模式：連不上就直接結束，回傳非 0 讓排程器看得出失敗
+    if not check_db():
+        sys.exit(1)
     reset_stuck()
     if args.doc:
         process_pending(only_doc_id=args.doc)
-    elif args.loop:
-        log_info(f"[ingest] 常駐模式，每 {INGEST_INTERVAL_SEC} 秒一輪")
-        while True:
-            run_once()
-            time.sleep(INGEST_INTERVAL_SEC)
     else:
         run_once()

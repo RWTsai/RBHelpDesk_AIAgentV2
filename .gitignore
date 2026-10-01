@@ -34,3 +34,6 @@ desktop.ini
 ~$*
 .vscode/
 .idea/
+
+# ===== 文件匯入來源資料夾（DOC_DROP_FOLDER），內容是待匯入的公司文件 =====
+uploads/
