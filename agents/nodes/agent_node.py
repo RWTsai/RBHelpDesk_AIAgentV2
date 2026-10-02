@@ -103,6 +103,14 @@ def process_text(state: dict) -> dict:
         state["reply_text"] = "我沒有收到文字訊息，可以再傳一次嗎？"
         return state
 
+    # 向量快取還在載入（剛重啟）→ 立刻回覆，不要讓使用者等整個載入跑完。
+    # 要擺在 loading 動畫之前，否則會先顯示「輸入中」再秒回，看起來很怪。
+    if not doc_graph_client.is_ready():
+        log_info("[AGENT] 向量快取尚未載入完成，先請使用者稍後再試")
+        state["reply_text"] = ("系統剛啟動，正在載入知識庫（約需 1 分鐘），"
+                              "請稍後再問一次。若急需協助，請輸入「真人客服」。")
+        return state
+
     # 先送 loading 動畫，讓使用者知道正在處理
     start_loading(user_id)
 

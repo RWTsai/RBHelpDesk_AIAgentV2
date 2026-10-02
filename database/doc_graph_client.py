@@ -262,6 +262,18 @@ def warmup():
     ensure_cache(force=True)
 
 
+def is_ready() -> bool:
+    """
+    向量快取載入完了沒。
+
+    為什麼需要：載入實測要 15～57 秒，而 app.py 是用背景執行緒預熱、Flask 同時就
+    開始收請求。這段期間進來的請求會卡在 _LOCK 上等整個載入跑完，整題可能超過 80
+    秒、遠超 LINE 的 reply token 視窗，只能改走 Push，Push 再失敗使用者就什麼都
+    收不到。所以寧可先用一句話把人擋回來，不要讓他等到訊息消失。
+    """
+    return bool(_CACHE.get("loaded"))
+
+
 def _top_k(mat, q, k, min_score):
     """回傳 [(索引, 分數)]，依分數由高到低"""
     if mat is None or k <= 0:
