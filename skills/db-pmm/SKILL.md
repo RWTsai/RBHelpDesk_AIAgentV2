@@ -56,7 +56,7 @@ PMM 同一個詞在不同階段指的是不同資料，問法不夠具體就直�
 
 1. **哪個業務階段**——苗株栽培／採收後商品庫存／訂單出貨（見「栽培階段 vs 出貨階段」）
 2. **哪條產線**——台灣／越南種苗／越南切花／越南盆花（見「產線」）
-3. **哪個分析對象與期間**——良率、歷史變化、訂單供貨都必須有對象（品種／批次／規格／產線）和日期範圍
+3. **哪個分析對象與期間**——良率、歷史變化、訂單供貨、栽培時間都必須有對象（品種／批次／規格／產線）和日期範圍；問「種多久」還要問**起算點**（進貨日或某階段），迄點預設為詢問當下
 
 澄清要**一次把選項列出來**，不要只問「請問是哪一個」：
 
@@ -487,6 +487,94 @@ GROUP BY 移轉原因 ORDER BY 2 DESC
 `YPProductionBatchProcessLog` 記翻種製程歷程。
 
 所以「哪個生產階段損耗最大」要 `GROUP BY` 的是 **`ProcessID`**（或 `SpecBegin`／`SpecEnd`），不是 `SpecID`。
+
+## 栽培時間（種了幾個月／幾週）
+
+使用者問「某品種／某批號種了幾個月」「種幾週了」時，**除非他已經講明起算點，否則一定要先問，不要自己挑進貨日直接算**：
+
+> 請問要從哪裡起算？
+> 1. **進貨日**（整個生產週期）
+> 2. **某個階段開始**——請說明是哪一個階段（例如出瓶後、0075 翻種後）
+
+**迄點不用問**，預設就是**詢問當下**（`GETDATE()`）。只有使用者自己說要算到某階段完工或某個指定日期時才改。
+
+使用者回答之前**不要先給一個預設答案**——同一個批號「從進貨算」和「從某階段算」差好幾個月，先給數字會被當成結論。
+
+資料來源是 `YPProductionBatch` 的三個日期：
+
+| 欄位 | 意思 |
+|------|------|
+| `PurchaseDate` | 進貨日（整個週期的起點） |
+| `ProcessDate` | **該階段製程的起始日** |
+| `CompletedDate` | **該階段的完工日** |
+
+每個階段在 `YPProductionBatch` 各佔一列（搭配該列的 `ProcessID`／`SpecID`），所以「各階段分別種多久」就是逐列算 `ProcessDate` → `CompletedDate`。
+
+### 三個會算錯的地方（實測）
+
+1. **沒有 NULL，空值是 `0001-01-01`。**`WHERE ProcessDate IS NULL` 永遠不會命中。要排除空值得寫 `ProcessDate > '1900-01-01'`。實測 `ProcessDate` 空值 5,148 列、`CompletedDate` 空值 55 列、`PurchaseDate` **沒有**空值。
+2. **`CompletedDate` 可能是未來日期**（實測 5,625 列），代表**還沒完工**、那是預計完工日。直接用它會算出「未來才結束」的負天數或灌水的天數。終點一律要包一層：
+   `CASE WHEN CompletedDate > GETDATE() OR CompletedDate <= '1900-01-01' THEN GETDATE() ELSE CompletedDate END`
+   順便用同一個條件標出「進行中／已完工」。
+3. **`BatchNo` 不唯一**，同一批號同一階段會重複出現（一個來源批次一列），**一定要 `DISTINCT` 或 `GROUP BY`**，否則同一個階段會被列出十幾次。
+
+> `CompletedDate` 不等於 `ProcessDate + BIProcess.WorkDay`（實測 43,576 列相同、56,996 列不同），`WorkDay` 只是**預計**天數。要比較「實際 vs 預計」可以把兩者並列。
+
+### 某批號各階段種多久
+
+```sql
+SELECT DISTINCT pr.Name AS 階段, sp.Code AS 規格,
+       CONVERT(date, b.ProcessDate)   AS 起始,
+       CONVERT(date, b.CompletedDate) AS 完工,
+       CASE WHEN b.CompletedDate > GETDATE() OR b.CompletedDate <= '1900-01-01'
+            THEN N'進行中' ELSE N'已完工' END AS 狀態,
+       DATEDIFF(day, b.ProcessDate,
+         CASE WHEN b.CompletedDate > GETDATE() OR b.CompletedDate <= '1900-01-01'
+              THEN GETDATE() ELSE b.CompletedDate END) AS 天數,
+       DATEDIFF(day, b.ProcessDate,
+         CASE WHEN b.CompletedDate > GETDATE() OR b.CompletedDate <= '1900-01-01'
+              THEN GETDATE() ELSE b.CompletedDate END) / 7 AS 週數,
+       pr.WorkDay AS 預計天數
+FROM YPProductionBatch b
+LEFT JOIN BIProcess pr ON b.ProcessID = pr.ID
+LEFT JOIN BISpec   sp ON b.SpecID    = sp.ID
+WHERE b.BatchNo COLLATE Chinese_Taiwan_Stroke_CI_AS = N'使用者給的批號'
+  AND b.ProcessDate > '1900-01-01'
+ORDER BY 起始
+```
+
+### 某批號從進貨到現在總共幾個月
+
+```sql
+SELECT MIN(CONVERT(date, b.PurchaseDate)) AS 進貨日,
+       DATEDIFF(day, MIN(b.PurchaseDate), GETDATE())              AS 天數,
+       DATEDIFF(day, MIN(b.PurchaseDate), GETDATE()) / 7          AS 週數,
+       CAST(DATEDIFF(day, MIN(b.PurchaseDate), GETDATE()) / 30.44 AS decimal(5,1)) AS 月數
+FROM YPProductionBatch b
+WHERE b.BatchNo COLLATE Chinese_Taiwan_Stroke_CI_AS = N'使用者給的批號'
+```
+
+（實測批號 `DH25V0902`：進貨 2025-07-12，到 2026-10-02 為 447 天＝63 週＝14.7 個月。）
+
+- 換算用 **天數 ÷ 7 ＝ 週**、**天數 ÷ 30.44 ＝ 月**；月數留一位小數，週數取整數。
+- 使用者問「幾週」就給週、問「幾個月」就給月，但**一定要附起訖日期**，否則他無法判斷對不對。
+
+### 某品種種多久
+
+品種要先展開所有別名（見「品種、別名與來源業者」），而且**一個品種有很多批次，要給分布不要給單一數字**：
+
+```sql
+SELECT COUNT(DISTINCT b.BatchNo) AS 批次數,
+       MIN(DATEDIFF(day, b.PurchaseDate, GETDATE())) AS 最短天數,
+       MAX(DATEDIFF(day, b.PurchaseDate, GETDATE())) AS 最長天數,
+       AVG(DATEDIFF(day, b.PurchaseDate, GETDATE())) AS 平均天數
+FROM YPProductionBatch b
+JOIN BIBreedAlias a ON b.BreedAliasID = a.ID
+JOIN BIBreed      br ON a.BreedID     = br.ID
+WHERE br.Name = N'使用者給的品種'
+```
+
+回答時要說明「這是目前仍在庫的批次」或「含已結束批次」——兩者差很多，不確定就問。
 
 ## 良率
 
