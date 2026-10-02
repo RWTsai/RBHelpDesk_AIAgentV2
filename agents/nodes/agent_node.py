@@ -35,6 +35,7 @@ from config import (
     AGENT_MAX_VERIFY_RETRY,
     AGENT_FAST_PATH,
     AGENT_NOTICE_SEC,
+    OPENAI_STORE_RESPONSES,
     QA_FAST_PATH_MIN_SCORE,
     QA_PREFETCH_MIN_SCORE,
     VERIFY_ENABLED,
@@ -236,13 +237,14 @@ def _agent_loop(question, history, kw_skills, skill_text, trace, qa_hits=(), not
     if skill_text:
         system += "\n\n【已載入的 Skill（依此處理）】\n" + skill_text
 
-    messages = [{"role": "system", "content": system}]
+    # Responses API 的系統提示走 instructions 參數，不放在 input 裡
+    conv = []
     for h in history:
         if h.get("user"):
-            messages.append({"role": "user", "content": str(h["user"])})
+            conv.append({"role": "user", "content": str(h["user"])})
         if h.get("assistant"):
-            messages.append({"role": "assistant", "content": str(h["assistant"])})
-    messages.append({"role": "user", "content": question})
+            conv.append({"role": "assistant", "content": str(h["assistant"])})
+    conv.append({"role": "user", "content": question})
 
     evidence = {}      # source_id → item（去重後的全部證據）
     tools_used = []    # 依序記錄用過的工具名稱
@@ -254,7 +256,7 @@ def _agent_loop(question, history, kw_skills, skill_text, trace, qa_hits=(), not
         for it in prefetch:
             evidence[it["source_id"]] = it
         tools_used.append("search_qa_kb")      # 讓驗證器照樣檢查這批證據
-        messages.append({"role": "user", "content": (
+        conv.append({"role": "user", "content": (
             "[系統訊息，使用者看不到] 已經先幫你查過 QA 知識庫（等同 search_qa_kb），結果如下，"
             "不要重複呼叫 search_qa_kb：\n"
             + agent_tools.result_to_text({"ok": True, "items": prefetch})
@@ -270,32 +272,26 @@ def _agent_loop(question, history, kw_skills, skill_text, trace, qa_hits=(), not
         # ---------- 規劃／行動 ----------
         force_answer = steps >= AGENT_MAX_STEPS  # 步數用完：禁止再呼叫工具，直接作答
         t = time.time()
-        kwargs = {"model": OPENAI_MODEL_CHAT, "messages": messages}
+        kwargs = {"model": OPENAI_MODEL_CHAT, "instructions": system, "input": conv}
         if registry:
-            kwargs["tools"] = agent_tools.to_openai_tools(registry)
+            kwargs["tools"] = agent_tools.to_responses_tools(registry)
             kwargs["tool_choice"] = "none" if force_answer else "auto"
-        res = _chat(**kwargs)
-        msg = res.choices[0].message
-        _step(trace, "llm", t, round=steps + 1, tool_calls=[tc.function.name for tc in (msg.tool_calls or [])])
+        res = _respond(**kwargs)
+        calls = [o for o in res.output if o.type == "function_call"]
+        _step(trace, "llm", t, round=steps + 1, tool_calls=[c.name for c in calls])
 
-        if msg.tool_calls and not force_answer:
+        if calls and not force_answer:
             if notify:
-                notify([tc.function.name for tc in msg.tool_calls])
-            messages.append({
-                "role": "assistant",
-                "content": msg.content or "",
-                "tool_calls": [
-                    {"id": tc.id, "type": "function",
-                     "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
-                    for tc in msg.tool_calls
-                ],
-            })
-            for tc, out_text in _run_tool_calls(msg.tool_calls, registry, loaded_skills, evidence, tools_used, trace):
-                messages.append({"role": "tool", "tool_call_id": tc.id, "content": out_text})
+                notify([c.name for c in calls])
+            # 把這一輪模型自己產生的 output 原封不動接回去（含 reasoning 項目——
+            # 少了它們，下一輪的 function_call_output 會對不上它的 function_call）
+            conv += [o.to_dict() for o in res.output]
+            for c, out_text in _run_tool_calls(calls, registry, loaded_skills, evidence, tools_used, trace):
+                conv.append({"type": "function_call_output", "call_id": c.call_id, "output": out_text})
             steps += 1
             continue
 
-        draft = msg.content or ""
+        draft = res.output_text or ""
 
         # ---------- 3) 驗證 ----------
         if not VERIFY_ENABLED or not tools_used or set(tools_used) <= _SELF_EVIDENT_TOOLS:
@@ -314,15 +310,15 @@ def _agent_loop(question, history, kw_skills, skill_text, trace, qa_hits=(), not
         if v.verdict == "needs_more" and verify_retry < AGENT_MAX_VERIFY_RETRY:
             verify_retry += 1
             steps = min(steps, AGENT_MAX_STEPS - 1)  # 至少再給一輪工具呼叫
-            messages.append({"role": "assistant", "content": draft})
-            messages.append({"role": "user", "content": (
+            conv += [o.to_dict() for o in res.output]
+            conv.append({"role": "user", "content": (
                 f"[系統品質檢查回饋，使用者看不到] 草稿還缺少：{v.missing_info or '關鍵資訊'}。"
                 f"建議：{v.feedback}。請再查詢補足後重新回答；若確實查不到，請明確說明查不到的部分。"
             )})
             continue
 
         # fail，或 needs_more 已用完補查次數 → 保守改寫
-        draft = _conservative_rewrite(messages, draft, v, trace)
+        draft = _conservative_rewrite(system, conv, draft, v, trace)
         trace["verdict"] = "fail" if v.verdict == "fail" else "needs_more"
         break
 
@@ -331,20 +327,24 @@ def _agent_loop(question, history, kw_skills, skill_text, trace, qa_hits=(), not
 
 
 def _run_tool_calls(tool_calls, registry, loaded_skills, evidence, tools_used, trace):
-    """同一輪的多個工具並行執行；load_skill 在主執行緒處理（會修改 registry）"""
+    """
+    同一輪的多個工具並行執行；load_skill 在主執行緒處理（會修改 registry）。
+    tool_calls 是 Responses API 的 function_call 項目，欄位為 call_id／name／arguments
+    （Chat Completions 那套是 id／function.name／function.arguments）。
+    """
     results = {}
     normal = []
     for tc in tool_calls:
-        name = tc.function.name
+        name = tc.name
         try:
-            args = json.loads(tc.function.arguments or "{}")
+            args = json.loads(tc.arguments or "{}")
         except Exception:
             args = {}
         if name == "load_skill":
             t = time.time()
-            results[tc.id] = _load_skill(args.get("name", ""), registry, loaded_skills)
+            results[tc.call_id] = _load_skill(args.get("name", ""), registry, loaded_skills)
             tools_used.append(name)
-            _step(trace, "tool", t, tool=name, args=args, ok=results[tc.id].get("ok"))
+            _step(trace, "tool", t, tool=name, args=args, ok=results[tc.call_id].get("ok"))
         else:
             normal.append((tc, name, args))
 
@@ -362,7 +362,7 @@ def _run_tool_calls(tool_calls, registry, loaded_skills, evidence, tools_used, t
     if normal:
         with ThreadPoolExecutor(max_workers=min(4, len(normal))) as pool:
             for tc, name, res, detail, t in pool.map(_one, normal):
-                results[tc.id] = res
+                results[tc.call_id] = res
                 tools_used.append(name)
                 _step(trace, "tool", t, **detail)
                 for it in res.get("items", []):
@@ -370,7 +370,7 @@ def _run_tool_calls(tool_calls, registry, loaded_skills, evidence, tools_used, t
                         evidence[it["source_id"]] = it
 
     # 依原本順序回傳
-    return [(tc, agent_tools.result_to_text(results[tc.id])) for tc in tool_calls]
+    return [(tc, agent_tools.result_to_text(results[tc.call_id])) for tc in tool_calls]
 
 
 def _load_skill(name, registry, loaded_skills):
@@ -413,12 +413,13 @@ def _verify(question, evidence, draft) -> VerifyResult:
     return VerifyResult(verdict="pass")
 
 
-def _conservative_rewrite(messages, draft, v, trace):
+def _conservative_rewrite(system, conv, draft, v, trace):
     t = time.time()
     try:
-        res = _chat(
+        res = _respond(
             model=OPENAI_MODEL_CHAT,
-            messages=messages + [
+            instructions=system,
+            input=conv + [
                 {"role": "assistant", "content": draft},
                 {"role": "user", "content": CONSERVATIVE_PROMPT.format(
                     unsupported="；".join(v.unsupported_claims) or "（無）",
@@ -426,7 +427,7 @@ def _conservative_rewrite(messages, draft, v, trace):
                 )},
             ],
         )
-        out = res.choices[0].message.content or ""
+        out = res.output_text or ""
         _step(trace, "conservative_rewrite", t)
         return out
     except Exception as e:
@@ -438,7 +439,7 @@ def _conservative_rewrite(messages, draft, v, trace):
 # =====================================================
 # 小工具
 # =====================================================
-# 每個（模型, 有沒有帶工具）組合該怎麼給 reasoning_effort，試成功一次就記起來。
+# 每個（API, 模型, 有沒有帶工具）組合該怎麼給推理強度，試成功一次就記起來。
 # 不記的話每一次呼叫都要先失敗一輪，白白多等一趟 HTTP。
 _REASONING_MODE = {}
 
@@ -455,24 +456,29 @@ _REASONING_ORDER = {
 }
 
 
-def _chat(**kwargs):
+def _call_model(create, api, effort_param, **kwargs):
     """
-    呼叫 Chat Completions，並吸收各家模型對 reasoning_effort 的差異。
-    同一個模型第一次會依序試，成功後把用法記在 _REASONING_MODE，之後直接用對的那個。
+    呼叫模型，並吸收各家模型對推理強度參數的差異。
+
+    create       = client.chat.completions.create 或 client.responses.create
+    api          = "chat" / "responses"，只用來分開快取
+    effort_param = 把強度值包成該 API 的參數形狀：
+                   Chat Completions → {"reasoning_effort": "low"}
+                   Responses        → {"reasoning": {"effort": "low"}}
     """
     model = kwargs.get("model")
-    key = (model, bool(kwargs.get("tools")))      # 限制常常只在「帶工具」時才出現
+    key = (api, model, bool(kwargs.get("tools")))   # 限制常常只在「帶工具」時才出現
     start = _REASONING_MODE.get(key, "effort" if AGENT_REASONING_EFFORT else "omit")
 
     last, errors = None, []
     for mode in _REASONING_ORDER[start]:
+        extra = {}
+        if mode == "effort":
+            extra = effort_param(AGENT_REASONING_EFFORT)
+        elif mode == "none":
+            extra = effort_param("none")
         try:
-            if mode == "effort":
-                res = client.chat.completions.create(reasoning_effort=AGENT_REASONING_EFFORT, **kwargs)
-            elif mode == "none":
-                res = client.chat.completions.create(reasoning_effort="none", **kwargs)
-            else:
-                res = client.chat.completions.create(**kwargs)
+            res = create(**kwargs, **extra)
         except Exception as e:
             last = e
             errors.append(str(e))
@@ -481,19 +487,36 @@ def _chat(**kwargs):
             continue
         if _REASONING_MODE.get(key) != mode:
             _REASONING_MODE[key] = mode
-            log_info(f"[AGENT] {model}{'（含工具）' if key[1] else ''} 的 reasoning_effort 用法：{mode}")
+            log_info(f"[AGENT] {api}／{model}{'（含工具）' if key[2] else ''} 的推理強度用法：{mode}")
         return res
 
-    # 每種寫法都被拒。最常見的原因是這個模型在 Chat Completions 上不支援 function
-    # tools（例如 gpt-6-astra：帶工具時 low／none／省略全部回 400，而它又不接受
-    # none，所以沒有任何組合能成立）。直接講清楚要改什麼，不要只丟原始 400。
-    if key[1] and any("/v1/responses" in m for m in errors):
+    # 每種寫法都被拒。帶工具時最常見的原因是這個模型在 Chat Completions 不支援
+    # function tools（Astra／Sol 的 tool calling 只支援 Responses API）。
+    if api == "chat" and key[2] and any("/v1/responses" in m for m in errors):
         raise RuntimeError(
-            f"模型 {model} 在 Chat Completions 不支援 function tools，Agent 迴圈無法使用。"
-            f"請把 .env 的 OPENAI_MODEL_CHAT 換成支援工具呼叫的模型（例如 gpt-5.1）；"
-            f"{model} 可以留給不需要工具的 OPENAI_MODEL_FAST。原始錯誤：{last}"
+            f"模型 {model} 在 Chat Completions 不支援 function tools。"
+            f"Agent 迴圈已改走 Responses API，若仍看到這個錯誤表示有程式走了舊路徑。原始錯誤：{last}"
         ) from last
     raise last
+
+
+def _respond(**kwargs):
+    """Responses API。Agent 迴圈用這支——新模型的 tool calling 只支援這個 API。"""
+    kwargs.setdefault("store", OPENAI_STORE_RESPONSES)
+    return _call_model(
+        client.responses.create, "responses",
+        lambda v: {"reasoning": {"effort": v}},
+        **kwargs,
+    )
+
+
+def _chat(**kwargs):
+    """Chat Completions。快速路徑與保守改寫用這支（都不帶工具）。"""
+    return _call_model(
+        client.chat.completions.create, "chat",
+        lambda v: {"reasoning_effort": v},
+        **kwargs,
+    )
 
 
 def _split_sources(text):

@@ -71,6 +71,11 @@ OPENAI_MODEL_EXTRACT = _env_str("OPENAI_MODEL_EXTRACT", "gpt-4o")     # 三元�
 OPENAI_MODEL_VISION = _env_str("OPENAI_MODEL_VISION", "gpt-4o")       # 圖片分析
 AGENT_REASONING_EFFORT = _env_str("AGENT_REASONING_EFFORT", "low")    # 推理強度，空值＝不帶此參數
 
+# Agent 迴圈走 Responses API（新模型的 tool calling 只支援這個 API）。
+# Responses 預設會把整段對話留在 OpenAI 端供事後取回，而這裡送的是內部知識庫與
+# 資料庫查詢結果，所以預設關閉留存；要用 OpenAI 後台追問題時才打開。
+OPENAI_STORE_RESPONSES = _env_bool("OPENAI_STORE_RESPONSES", False)
+
 # --- Agent ---
 AGENT_MODE = _env_bool("AGENT_MODE", True)                    # False＝退回舊的 ai_text_node 管線
 AGENT_MAX_STEPS = _env_int("AGENT_MAX_STEPS", 4)              # 最多幾輪工具呼叫

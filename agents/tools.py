@@ -901,9 +901,13 @@ def check_sql_sources():
                   f"（或在 .env 設 SQL_SOURCES={want} 由 IT 統一管理）")
 
 
-def to_openai_tools(registry: dict) -> list:
+def to_responses_tools(registry: dict) -> list:
+    """
+    Responses API 的工具宣告：name／description／parameters 直接攤在最外層，
+    不像 Chat Completions 要再包一層 "function"。
+    """
     return [
-        {"type": "function", "function": {"name": name, "description": t["description"], "parameters": t["parameters"]}}
+        {"type": "function", "name": name, "description": t["description"], "parameters": t["parameters"]}
         for name, t in registry.items()
     ]
 
