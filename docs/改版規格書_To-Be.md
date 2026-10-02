@@ -315,6 +315,7 @@ feedback: 給 Agent 的修正建議
 
 - 開始處理時呼叫 LINE loading 動畫 API（`POST /v2/bot/chat/loading/start`）。
 - `reply_line_node.py` 在 reply token 失效（或處理時間超過 `LINE_PUSH_FALLBACK_SEC`）時改用 Push API（`/v2/bot/message/push`，對象為 state 中的 `user_id`）。
+- **處理中的進度訊息**（v1.9 新增）：問題越複雜、工具輪數越多就越慢（實測單題可達 30 秒以上）。處理超過 `AGENT_NOTICE_SEC`（預設 8 秒）還在呼叫工具時，`agent_node._progress_notifier()` 會推播一則進度訊息，內容是**依該輪實際叫到的工具**組出來的白話說法（例如「我需要查資料庫」「翻手冊和簡報」），不另外呼叫 LLM 以免更慢。一題只送一次，送完順便重新觸發 loading 動畫避免「輸入中」提前消失。設 `AGENT_NOTICE_SEC=0` 關閉。**理由**：loading 動畫最多只撐 60 秒而且不說明在做什麼，使用者看不到回應會以為當掉而重複發問；先讓他知道「問題已讀懂、正在查什麼」比單純轉圈有用。**代價**：進度訊息會計入 LINE 官方帳號的訊息則數。
 
 ### 4.6a Webhook 簽章驗證（v1.9 新增）
 

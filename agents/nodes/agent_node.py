@@ -34,6 +34,7 @@ from config import (
     AGENT_MAX_STEPS,
     AGENT_MAX_VERIFY_RETRY,
     AGENT_FAST_PATH,
+    AGENT_NOTICE_SEC,
     QA_FAST_PATH_MIN_SCORE,
     QA_PREFETCH_MIN_SCORE,
     VERIFY_ENABLED,
@@ -52,12 +53,24 @@ from agents import skill_loader
 from database import doc_graph_client
 from utils.text_cleaner import clean_basic
 from utils.logger import log_info, log_error
-from .utils_line import start_loading
+from .utils_line import start_loading, push_messages
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # 驗證略過的情況：只用了這些工具（結果本身就是依據）
 _SELF_EVIDENT_TOOLS = {"sql_query", "load_skill"}
+
+# 進度訊息用：工具名稱 -> 講給使用者聽的說法（不要出現工具名或資料表名）
+_TOOL_PHRASE = {
+    "search_qa_kb": "翻 QA 知識庫",
+    "search_documents": "翻手冊和簡報",
+    "explore_entity": "追相關的項目",
+    "web_search": "查網路上的資料",
+    "sql_query": "查資料庫",
+    "describe_table": "確認資料庫欄位",
+    "load_skill": "調出處理規則",
+    "read_reference": "查參考文件",
+}
 
 _SOURCES_RE = re.compile(r"^\s*SOURCES\s*[:：]\s*(.*)$", re.IGNORECASE | re.MULTILINE)
 
@@ -110,7 +123,8 @@ def process_text(state: dict) -> dict:
 
         # ---------- 2) Agent 迴圈 + 3) 驗證 ----------
         if reply is None:
-            reply, sources = _agent_loop(question, history, kw_skills, skill_text, trace, qa_hits)
+            notify = _progress_notifier(user_id, t0, trace)
+            reply, sources = _agent_loop(question, history, kw_skills, skill_text, trace, qa_hits, notify)
 
     except Exception as e:
         log_error(f"[AGENT] 執行失敗：{e}")
@@ -128,6 +142,34 @@ def process_text(state: dict) -> dict:
     log_info(f"[AGENT] 完成，verdict={trace['verdict']}，耗時 {latency_ms} ms")
     _write_trace(user_id, question, trace, reply, latency_ms)
     return state
+
+
+def _progress_notifier(user_id, t0, trace):
+    """
+    回傳一個 notify(tool_names) 函式：處理太久時推播一則進度訊息。
+
+    為什麼需要：問題越複雜、工具輪數越多就越慢（實測可到 30 秒以上），
+    使用者看不到任何回應會以為當掉而重複發問。loading 動畫最多只撐 60 秒
+    而且什麼都沒說，所以超過門檻就直接告訴他「我讀懂了，正在查什麼」。
+    一題只送一次；CLI（沒有 user_id）與關閉時都直接略過。
+    """
+    sent = []
+
+    def notify(tool_names):
+        if sent or not AGENT_NOTICE_SEC or not user_id:
+            return
+        if time.time() - t0 < AGENT_NOTICE_SEC:
+            return
+        sent.append(True)
+        # 用這一輪實際叫到的工具組句子，不另外呼叫 LLM（那會讓它更慢）
+        acts = [_TOOL_PHRASE[n] for n in dict.fromkeys(tool_names) if n in _TOOL_PHRASE]
+        what = "、".join(acts) if acts else "多查幾個地方"
+        text = f"收到，你的問題我需要{what}，還要一點時間，請稍等一下不用重複發問。"
+        push_messages(user_id, [{"type": "text", "text": text}])
+        start_loading(user_id)      # 動畫續命，避免「輸入中」先消失
+        _step(trace, "progress_notice", 0, tools=acts)
+
+    return notify
 
 
 # =====================================================
@@ -180,7 +222,7 @@ def _fast_path(question, history, skill_text, trace):
 # =====================================================
 # 2) Agent 迴圈
 # =====================================================
-def _agent_loop(question, history, kw_skills, skill_text, trace, qa_hits=()):
+def _agent_loop(question, history, kw_skills, skill_text, trace, qa_hits=(), notify=None):
     registry = agent_tools.build_base_tools()
     loaded_skills = {s["name"] for s in kw_skills}
     # 已注入的 skill 若帶工具，直接加進可用工具
@@ -237,6 +279,8 @@ def _agent_loop(question, history, kw_skills, skill_text, trace, qa_hits=()):
         _step(trace, "llm", t, round=steps + 1, tool_calls=[tc.function.name for tc in (msg.tool_calls or [])])
 
         if msg.tool_calls and not force_answer:
+            if notify:
+                notify([tc.function.name for tc in msg.tool_calls])
             messages.append({
                 "role": "assistant",
                 "content": msg.content or "",

@@ -77,6 +77,11 @@ AGENT_MAX_STEPS = _env_int("AGENT_MAX_STEPS", 4)              # 最多幾輪工�
 AGENT_MAX_VERIFY_RETRY = _env_int("AGENT_MAX_VERIFY_RETRY", 1)  # 驗證 needs_more 時最多補查幾次
 AGENT_TOOL_RESULT_MAX_CHARS = _env_int("AGENT_TOOL_RESULT_MAX_CHARS", 4000)
 AGENT_FAST_PATH = _env_bool("AGENT_FAST_PATH", True)
+
+# 處理超過這個秒數還在呼叫工具，就先推播一則進度訊息告訴使用者正在查什麼。
+# 問題越複雜、工具輪數越多就越慢，沉默太久使用者會以為當掉而重複發問。
+# 設 0 關閉。注意：進度訊息會計入 LINE 官方帳號的訊息則數。
+AGENT_NOTICE_SEC = _env_float("AGENT_NOTICE_SEC", 8.0)
 QA_FAST_PATH_MIN_SCORE = _env_float("QA_FAST_PATH_MIN_SCORE", 0.80)
 # 快速路徑分數不夠時，這批 QA 命中仍當成「已查過」的證據帶進 Agent 迴圈；
 # 低於此分數視為雜訊不帶入（例如問安），設 0 則一律帶入
