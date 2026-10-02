@@ -16,7 +16,7 @@ python-dotenv
 pillow
 flask
 # ---- To-Be 新增：文件 GraphRAG / Agent / Skill ----
-openai>=1.40
+openai>=1.66          # Agent 迴圈用 Responses API（client.responses），1.66 才有
 numpy
 pydantic>=2
 pymupdf

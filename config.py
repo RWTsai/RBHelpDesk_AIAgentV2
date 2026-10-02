@@ -292,6 +292,14 @@ def print_config_status():
     print(f"sql_query: {'.env 來源：' + ', '.join(ENV_SQL_SOURCES) if ENV_SQL_SOURCES else '.env 未設來源（看下方 Skill 來源）'}")
     print(f"web_search: {'ON' if SERPAPI_API_KEY else 'OFF'}")
     print(f"GDrive 同步: {'ON' if GDRIVE_FOLDER_IDS and GDRIVE_SA_JSON else 'OFF'}")
+    # Agent 迴圈靠 client.responses（openai>=1.66）。舊版 SDK 要等使用者問了才會
+    # 噴 AttributeError，部署時很難查，所以啟動就講清楚。
+    try:
+        import openai
+        ok = hasattr(openai.OpenAI(api_key="x"), "responses")
+        print(f"openai SDK: {openai.__version__}{'' if ok else '  <-- 太舊，沒有 Responses API，Agent 迴圈會失敗，請 pip install -U openai'}")
+    except Exception as e:
+        print(f"openai SDK: 檢查失敗 {e}")
     print(f"OneDrive 同步: {'ON' if ONEDRIVE_SHARE_URLS and M365_CLIENT_ID else 'OFF'}")
     print("======================")
 
