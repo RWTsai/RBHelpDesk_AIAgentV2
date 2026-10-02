@@ -438,19 +438,62 @@ def _conservative_rewrite(messages, draft, v, trace):
 # =====================================================
 # 小工具
 # =====================================================
+# 每個（模型, 有沒有帶工具）組合該怎麼給 reasoning_effort，試成功一次就記起來。
+# 不記的話每一次呼叫都要先失敗一輪，白白多等一趟 HTTP。
+_REASONING_MODE = {}
+
+# 三種給法，依序退讓：
+#   effort = 照 AGENT_REASONING_EFFORT 帶
+#   omit   = 完全不帶（gpt-4o／gpt-4o-mini 這類不認識這個參數的模型）
+#   none   = 明確帶 "none"。**省略不等於 none** —— 省略時模型會沿用自己的預設推理強度，
+#            所以有些模型省略還是會被拒，要明確給 none 才行；但也有模型（gpt-6-astra）
+#            反過來不接受 none，因此放在最後一個才試
+_REASONING_ORDER = {
+    "effort": ("effort", "omit", "none"),
+    "omit": ("omit", "none"),
+    "none": ("none",),
+}
+
+
 def _chat(**kwargs):
     """
-    呼叫 Chat Completions；有設定 AGENT_REASONING_EFFORT 時帶上，
-    若模型不支援此參數（例如 gpt-4o）自動拿掉重試。
+    呼叫 Chat Completions，並吸收各家模型對 reasoning_effort 的差異。
+    同一個模型第一次會依序試，成功後把用法記在 _REASONING_MODE，之後直接用對的那個。
     """
-    if AGENT_REASONING_EFFORT:
+    model = kwargs.get("model")
+    key = (model, bool(kwargs.get("tools")))      # 限制常常只在「帶工具」時才出現
+    start = _REASONING_MODE.get(key, "effort" if AGENT_REASONING_EFFORT else "omit")
+
+    last, errors = None, []
+    for mode in _REASONING_ORDER[start]:
         try:
-            return client.chat.completions.create(reasoning_effort=AGENT_REASONING_EFFORT, **kwargs)
+            if mode == "effort":
+                res = client.chat.completions.create(reasoning_effort=AGENT_REASONING_EFFORT, **kwargs)
+            elif mode == "none":
+                res = client.chat.completions.create(reasoning_effort="none", **kwargs)
+            else:
+                res = client.chat.completions.create(**kwargs)
         except Exception as e:
+            last = e
+            errors.append(str(e))
             if "reasoning" not in str(e).lower():
-                raise
-            log_info(f"[AGENT] 模型 {kwargs.get('model')} 不支援 reasoning_effort，改用預設")
-    return client.chat.completions.create(**kwargs)
+                raise                              # 跟 reasoning 無關的錯誤不要吞掉
+            continue
+        if _REASONING_MODE.get(key) != mode:
+            _REASONING_MODE[key] = mode
+            log_info(f"[AGENT] {model}{'（含工具）' if key[1] else ''} 的 reasoning_effort 用法：{mode}")
+        return res
+
+    # 每種寫法都被拒。最常見的原因是這個模型在 Chat Completions 上不支援 function
+    # tools（例如 gpt-6-astra：帶工具時 low／none／省略全部回 400，而它又不接受
+    # none，所以沒有任何組合能成立）。直接講清楚要改什麼，不要只丟原始 400。
+    if key[1] and any("/v1/responses" in m for m in errors):
+        raise RuntimeError(
+            f"模型 {model} 在 Chat Completions 不支援 function tools，Agent 迴圈無法使用。"
+            f"請把 .env 的 OPENAI_MODEL_CHAT 換成支援工具呼叫的模型（例如 gpt-5.1）；"
+            f"{model} 可以留給不需要工具的 OPENAI_MODEL_FAST。原始錯誤：{last}"
+        ) from last
+    raise last
 
 
 def _split_sources(text):
