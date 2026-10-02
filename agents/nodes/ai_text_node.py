@@ -18,6 +18,7 @@ from openai import OpenAI
 from config import OPENAI_API_KEY, OPENAI_MODEL_EMBED, OPENAI_MODEL_CHAT, OPENAI_MODEL_EXTRACT
 from database.graph_ragc_client import graph_rag_query
 from utils.text_cleaner import clean_basic, clean_ai_reply
+from utils.openai_compat import parse_structured
 from utils.logger import log_info, log_error
 
 
@@ -332,13 +333,14 @@ def tripleExtractService(text: str) -> dict:
     try:
 
         prompt = trip_prompt.replace("*user_question*", text)
-        gpt_res = client.chat.completions.parse(
-                        model=OPENAI_MODEL_EXTRACT,  # 改讀 .env
-                        messages=[
-                            {"role": "system", "content": "你是一個企業級 IT HelpDesk 智能助理，負責將使用者的問題轉換成可搜尋的結構化查詢"},
-                            {"role": "user", "content": prompt}
-                        ],
-                        response_format=TripleExtractionResponse 
+        gpt_res = parse_structured(
+            client,
+            model=OPENAI_MODEL_EXTRACT,  # 改讀 .env
+            messages=[
+                {"role": "system", "content": "你是一個企業級 IT HelpDesk 智能助理，負責將使用者的問題轉換成可搜尋的結構化查詢"},
+                {"role": "user", "content": prompt}
+            ],
+            response_format=TripleExtractionResponse
                        
                 )
         log_info(f"[AI_TEXT] Triple Extract 回覆:{gpt_res}")

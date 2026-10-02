@@ -70,6 +70,7 @@ from config import (
 )
 from database.doc_graph_client import norm_name, encode_vec, embed_texts
 from utils.logger import log_info, log_error, mask_secrets
+from utils.openai_compat import parse_structured
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 ENC = tiktoken.get_encoding("cl100k_base")  # text-embedding-3 系列使用的編碼
@@ -513,7 +514,8 @@ class GraphExtraction(BaseModel):
 def extract_graph(doc_name, section, text):
     """單一 chunk 抽實體與關係；失敗回傳空結果（不讓整份文件失敗）"""
     try:
-        res = client.chat.completions.parse(
+        res = parse_structured(
+            client,
             model=OPENAI_MODEL_EXTRACT,
             messages=[{"role": "user", "content": DOC_GRAPH_EXTRACTION_PROMPT.format(
                 doc_name=doc_name, section=section or "（無）", text=text)}],

@@ -87,6 +87,14 @@ AGENT_FAST_PATH = _env_bool("AGENT_FAST_PATH", True)
 # 問題越複雜、工具輪數越多就越慢，沉默太久使用者會以為當掉而重複發問。
 # 設 0 關閉。注意：進度訊息會計入 LINE 官方帳號的訊息則數。
 AGENT_NOTICE_SEC = _env_float("AGENT_NOTICE_SEC", 8.0)
+
+# 工具呼叫的時間預算（秒）。超過就不再呼叫工具，用已經查到的證據作答。
+# 為什麼需要：AGENT_MAX_STEPS 只限制「幾輪」，不限制「多久」。複雜問題（例如切花
+# 訂單供貨要比對訂單／庫存／採收／已出貨）實測可以跑到 99 秒，遠超過 LINE 的
+# reply token 視窗，只能改走 Push；Push 再失敗（配額用盡等）使用者就完全收不到。
+# 預設 40 秒，留餘裕讓驗證與回覆仍在 LINE_PUSH_FALLBACK_SEC(50) 之內用 reply token。
+# 設 0 表示不限時間。
+AGENT_TIME_BUDGET_SEC = _env_float("AGENT_TIME_BUDGET_SEC", 40.0)
 QA_FAST_PATH_MIN_SCORE = _env_float("QA_FAST_PATH_MIN_SCORE", 0.80)
 # 快速路徑分數不夠時，這批 QA 命中仍當成「已查過」的證據帶進 Agent 迴圈；
 # 低於此分數視為雜訊不帶入（例如問安），設 0 則一律帶入
@@ -296,8 +304,15 @@ def print_config_status():
     # 噴 AttributeError，部署時很難查，所以啟動就講清楚。
     try:
         import openai
-        ok = hasattr(openai.OpenAI(api_key="x"), "responses")
-        print(f"openai SDK: {openai.__version__}{'' if ok else '  <-- 太舊，沒有 Responses API，Agent 迴圈會失敗，請 pip install -U openai'}")
+        from utils.openai_compat import has_structured_parse
+        c = openai.OpenAI(api_key="x")
+        miss = []
+        if not hasattr(c, "responses"):
+            miss.append("Responses API（Agent 迴圈）")
+        if not has_structured_parse(c):
+            miss.append("結構化輸出 parse（驗證器與實體抽取）")
+        tail = "" if not miss else "  <-- 缺少 " + "、".join(miss) + "，請 pip install -U openai"
+        print(f"openai SDK: {openai.__version__}{tail}")
     except Exception as e:
         print(f"openai SDK: 檢查失敗 {e}")
     print(f"OneDrive 同步: {'ON' if ONEDRIVE_SHARE_URLS and M365_CLIENT_ID else 'OFF'}")

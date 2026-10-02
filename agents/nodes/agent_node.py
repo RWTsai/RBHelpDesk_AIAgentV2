@@ -35,6 +35,7 @@ from config import (
     AGENT_MAX_VERIFY_RETRY,
     AGENT_FAST_PATH,
     AGENT_NOTICE_SEC,
+    AGENT_TIME_BUDGET_SEC,
     OPENAI_STORE_RESPONSES,
     QA_FAST_PATH_MIN_SCORE,
     QA_PREFETCH_MIN_SCORE,
@@ -54,6 +55,7 @@ from agents import skill_loader
 from database import doc_graph_client
 from utils.text_cleaner import clean_basic
 from utils.logger import log_info, log_error
+from utils.openai_compat import parse_structured
 from .utils_line import start_loading, push_messages
 
 client = OpenAI(api_key=OPENAI_API_KEY)
@@ -125,7 +127,7 @@ def process_text(state: dict) -> dict:
         # ---------- 2) Agent 迴圈 + 3) 驗證 ----------
         if reply is None:
             notify = _progress_notifier(user_id, t0, trace)
-            reply, sources = _agent_loop(question, history, kw_skills, skill_text, trace, qa_hits, notify)
+            reply, sources = _agent_loop(question, history, kw_skills, skill_text, trace, qa_hits, notify, t0)
 
     except Exception as e:
         log_error(f"[AGENT] 執行失敗：{e}")
@@ -134,6 +136,16 @@ def process_text(state: dict) -> dict:
         reply = "AI 回覆時發生問題，請稍後再試。若急需協助，請輸入「真人客服」。"
 
     # ---------- 4) 參考來源 ----------
+    # 空字串在 reply 節點代表「人工客服模式，AI 靜默」，會整則不送。所以這裡
+    # 絕對不能讓其他原因產生的空回覆漏過去，否則使用者什麼都收不到也沒人知道。
+    if not (reply or "").strip():
+        log_error("[AGENT] 產出空回覆，改送提示訊息（verdict=%s）" % trace.get("verdict"))
+        _step(trace, "empty_reply", 0, verdict=trace.get("verdict"))
+        trace["verdict"] = "empty"
+        reply = ("這題我沒有組出完整的答案，可以換個說法或把條件說得更具體一點嗎？\n"
+                 "若需要資訊部同事協助，請輸入「真人客服」。")
+        sources = []
+
     if sources:
         reply = reply.rstrip() + "\n\n參考來源：\n" + "\n".join(sources)
 
@@ -216,14 +228,20 @@ def _fast_path(question, history, skill_text, trace):
         messages=[{"role": "system", "content": SYSROLE_PROMPT}, {"role": "user", "content": prompt}],
     )
     _step(trace, "fast_path_answer", t, model=OPENAI_MODEL_FAST)
+    answer = res.choices[0].message.content or ""
+    if not answer.strip():
+        # 模型沒給內容。回 None 讓它落到 Agent 迴圈，不要把空字串當成有效答案
+        # ——reply 節點看到空字串會整則不送，使用者會以為機器人死了。
+        log_error("[AGENT] 快速路徑回了空內容，改走 Agent 迴圈")
+        return None, hits
     trace["verdict"] = "fast_path"
-    return res.choices[0].message.content or "", hits
+    return answer, hits
 
 
 # =====================================================
 # 2) Agent 迴圈
 # =====================================================
-def _agent_loop(question, history, kw_skills, skill_text, trace, qa_hits=(), notify=None):
+def _agent_loop(question, history, kw_skills, skill_text, trace, qa_hits=(), notify=None, t0=None):
     registry = agent_tools.build_base_tools()
     loaded_skills = {s["name"] for s in kw_skills}
     # 已注入的 skill 若帶工具，直接加進可用工具
@@ -267,10 +285,34 @@ def _agent_loop(question, history, kw_skills, skill_text, trace, qa_hits=(), not
     steps = 0
     verify_retry = 0
     draft = None
+    forced_notice = False      # 強制作答的說明只插一次
+
+    def over_budget():
+        """時間是否用完。要能在迴圈各處重新評估，不能只在頂端算一次。"""
+        return bool(AGENT_TIME_BUDGET_SEC and t0 and (time.time() - t0) > AGENT_TIME_BUDGET_SEC)
 
     while True:
         # ---------- 規劃／行動 ----------
-        force_answer = steps >= AGENT_MAX_STEPS  # 步數用完：禁止再呼叫工具，直接作答
+        # 步數或時間任一用完，就禁止再呼叫工具、直接用手上的證據作答。
+        # 只看步數不夠——每一輪的耗時差很多，複雜問題會整題超出 LINE 的回覆視窗。
+        timed_out = over_budget()
+        if timed_out and steps < AGENT_MAX_STEPS and not forced_notice:
+            _step(trace, "time_budget", 0, elapsed=round(time.time() - t0, 1),
+                  budget=AGENT_TIME_BUDGET_SEC, round=steps + 1)
+        force_answer = steps >= AGENT_MAX_STEPS or timed_out
+        if force_answer and not forced_notice:
+            # 光把 tool_choice 設成 none，模型不知道發生什麼事；實測它會自己掰
+            # 「無法連到公司系統」再給一篇通用教學。必須明講原因與要求。
+            forced_notice = True
+            conv.append({"role": "user", "content": (
+                "[系統訊息，使用者看不到] 查詢次數或時間已用完，這一輪不要再呼叫任何工具，"
+                "直接用上面已經查到的資料作答。要求："
+                "(1) 已經查到的部分照實給出數字與結論；"
+                "(2) 還沒查到的部分明確說「這部分還沒查到」，並說明需要什麼條件才能查；"
+                "(3) 不可以說你無法連線、沒有資料庫權限或查不到系統——你有這些權限，"
+                "只是這次時間不夠；"
+                "(4) 若需要使用者補條件，直接問他。"
+            )})
         t = time.time()
         kwargs = {"model": OPENAI_MODEL_CHAT, "instructions": system, "input": conv}
         if registry:
@@ -301,13 +343,18 @@ def _agent_loop(question, history, kw_skills, skill_text, trace, qa_hits=(), not
 
         t = time.time()
         v = _verify(question, evidence, draft)
+        if v is None:
+            # 驗證器壞了（SDK 不相容、API 掛掉…）。不擋回覆，但紀錄要寫實話。
+            _step(trace, "verify", t, verdict="error")
+            trace["verdict"] = "verify_error"
+            break
         _step(trace, "verify", t, verdict=v.verdict, unsupported=v.unsupported_claims, missing=v.missing_info)
         trace["verdict"] = v.verdict
 
         if v.verdict == "pass":
             break
 
-        if v.verdict == "needs_more" and verify_retry < AGENT_MAX_VERIFY_RETRY:
+        if v.verdict == "needs_more" and verify_retry < AGENT_MAX_VERIFY_RETRY and not over_budget():
             verify_retry += 1
             steps = min(steps, AGENT_MAX_STEPS - 1)  # 至少再給一輪工具呼叫
             conv += [o.to_dict() for o in res.output]
@@ -316,6 +363,13 @@ def _agent_loop(question, history, kw_skills, skill_text, trace, qa_hits=(), not
                 f"建議：{v.feedback}。請再查詢補足後重新回答；若確實查不到，請明確說明查不到的部分。"
             )})
             continue
+
+        if over_budget() and v.verdict != "fail" and draft.strip():
+            # 時間已用完，草稿也不是「有幻覺」等級的問題 → 直接用草稿，
+            # 省下保守改寫那一次 LLM 呼叫（約 5～10 秒），讓訊息趕得上 LINE 的回覆視窗。
+            _step(trace, "skip_rewrite", 0, reason="time_budget")
+            trace["verdict"] = "needs_more"
+            break
 
         # fail，或 needs_more 已用完補查次數 → 保守改寫
         draft = _conservative_rewrite(system, conv, draft, v, trace)
@@ -399,7 +453,8 @@ def _verify(question, evidence, draft) -> VerifyResult:
     answer, _ = _split_sources(draft)
 
     try:
-        res = client.chat.completions.parse(
+        res = parse_structured(
+            client,
             model=OPENAI_MODEL_VERIFY,
             messages=[{"role": "user", "content": VERIFY_PROMPT.format(question=question, evidence=ev_text, draft=answer)}],
             response_format=VerifyResult,
@@ -407,10 +462,13 @@ def _verify(question, evidence, draft) -> VerifyResult:
         parsed = res.choices[0].message.parsed
         if parsed:
             return parsed
+        log_error("[AGENT] 驗證器沒有回傳結構化結果")
     except Exception as e:
-        log_error(f"[AGENT] 驗證器失敗，視為通過：{e}")
-    # 驗證器本身出錯時不擋回覆
-    return VerifyResult(verdict="pass")
+        log_error(f"[AGENT] 驗證器失敗：{e}")
+    # 驗證器自己壞掉時不擋使用者的回覆，但**不可以謊報成驗證通過**——
+    # 回 None 讓呼叫端把 verdict 記成 verify_error，否則稽核紀錄會顯示
+    # 「已驗證通過」，而其實一次都沒驗到。
+    return None
 
 
 def _conservative_rewrite(system, conv, draft, v, trace):
