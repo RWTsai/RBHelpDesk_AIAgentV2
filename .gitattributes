@@ -1,0 +1,7 @@
+# cmd.exe 讀批次檔一定要 CRLF。用 LF 的話它讀到行尾會對不準，
+# 吃掉下一行開頭幾個字元（rem 變成 m、if not exist 變成 xist）。
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# Windows PowerShell 5.1 也以 CRLF 為主
+*.ps1 text eol=crlf
