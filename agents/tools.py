@@ -29,6 +29,7 @@ import threading
 
 import pyodbc
 import sqlglot
+from fnmatch import fnmatchcase
 from sqlglot import exp
 
 from config import (
@@ -342,15 +343,17 @@ def sql_sources() -> dict:
         src = out.setdefault(name, {"conn": conn, "tables": [], "deny": [],
                                     "desc": skill["description"], "skill": "", "from": "skill"})
         src["tables"] += skill["tables"]
+        src["deny"] += skill["deny"]
 
     for name, env_src in ENV_SQL_SOURCES.items():
         out[name] = dict(env_src, **{"from": "env"})
 
-    # .env 的 DENY 一律套用（就算來源是 Skill 給的，IT 仍可擋表）
+    # Skill 宣告的 deny 也要套到 .env 來源（IT 接管某個資料庫時，Skill 的保護不該消失）
     for name, src in out.items():
-        deny = _env_deny(name)
-        if deny:
-            src["deny"] = sorted(set(src.get("deny", [])) | set(deny))
+        deny = set(src.get("deny", [])) | set(_env_deny(name))
+        for skill in skill_loader.skills_for_db(name):
+            deny |= set(skill["deny"])
+        src["deny"] = sorted(deny)
     return out
 
 
@@ -428,17 +431,18 @@ def _auto_tables(source: str):
 
 
 def _denied(key, deny_list):
-    """拒絕清單：可寫 表名、schema.表名，結尾 * 為前綴比對"""
+    """
+    拒絕清單：可寫 表名、schema.表名，並支援 glob（* 與 ?）。
+    原本只認「完全相同」和「結尾 *」，所以 PersonelPermission 比不到
+    View_PersonelPermission——寫了卻沒擋到，比沒寫更危險。
+    """
     schema, table = key
     for d in deny_list:
         d = d.strip().strip("[] ").lower()
         if not d:
             continue
         target = f"{schema}.{table}" if "." in d else table
-        if d.endswith("*"):
-            if target.startswith(d[:-1]):
-                return True
-        elif target == d:
+        if target == d or fnmatchcase(target, d):
             return True
     return False
 
@@ -882,10 +886,16 @@ def check_sql_sources():
               f"{'，Skill：' + ', '.join(s['name'] for s in bound) if bound else '，沒有對應的 Skill'}")
         if src.get("deny"):
             print(f"    - 已擋下：{', '.join(src['deny'])}")
+            print(f"      （來自 Skill 的 deny: 與 .env 的 SQL_{name.upper()}_DENY_TABLES）")
         if not bound:
             print(f"    [注意] 沒有 Skill 宣告 db: {name}，表的中文意義不會出現在工具說明裡")
         for skill in bound:
-            missing = [t for t in skill["tables"] if _table_key(t)[0] not in allowed]
+            # 被 deny 擋下的本來就不該在白名單裡，不是落差——混在警告裡會害人「修」錯方向
+            blocked = [t for t in skill["tables"] if _denied(_table_key(t)[0], src["deny"])]
+            if blocked:
+                print(f"    - Skill {skill['name']} 宣告但依 deny 擋下（正常）：{', '.join(blocked)}")
+            missing = [t for t in skill["tables"]
+                       if _table_key(t)[0] not in allowed and t not in blocked]
             if missing:
                 print(f"    [注意] Skill {skill['name']} 宣告但不在白名單的表（{len(missing)} 張）："
                       f"{', '.join(missing[:10])}{'…' if len(missing) > 10 else ''}")

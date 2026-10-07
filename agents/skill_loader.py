@@ -100,6 +100,12 @@ def _scan():
             tbl = meta.get("tables") or []
             if isinstance(tbl, str):
                 tbl = re.split(r"[,\n]", tbl)
+            # deny：Skill 自己宣告「這幾張不准查」（個資、權限表之類）。
+            # 為什麼要有：原本只能在 .env 設 SQL_<來源>_DENY_TABLES，少設一行就全開，
+            # 而裝設外來 Skill 的人不會知道該擋哪幾張。寫在 SKILL.md 裡，保護就跟著 Skill 走。
+            dny = meta.get("deny") or []
+            if isinstance(dny, str):
+                dny = re.split(r"[,\n]", dny)
             skill = {
                 "name": name,
                 "description": str(meta.get("description") or "").strip(),
@@ -107,6 +113,7 @@ def _scan():
                 # db：這個 Skill 要查哪個 SQL 來源（.env 的 SQL_SOURCES 名稱）；沒寫則看名稱是不是 db-<來源>
                 "db": str(meta.get("db") or "").strip().lower(),
                 "tables": [str(t).strip() for t in tbl if str(t).strip()],
+                "deny": [str(d).strip() for d in dny if str(d).strip()],
                 "body": body,
                 "dir": folder,
                 "tools": {},

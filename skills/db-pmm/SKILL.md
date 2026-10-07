@@ -2,6 +2,10 @@
 name: db-pmm
 description: PMM 蝴蝶蘭產銷管理系統：苗株／盆花／切花的生產批次、庫存移轉、需求單、配貨、出貨、採購契作、客戶、花色、死亡、移轉原因與品種主檔
 db: pmm
+# 不准查的表（支援 *）：人員帳號與角色權限屬個資，問答機器人沒有理由查。
+# 擋在這裡而不是 .env，是為了「少設一行就全開」不會再發生；IT 仍可用
+# SQL_PMM_DENY_TABLES 再加，但不能減。
+deny: BIPersonel*, BSRole*, BSPersonalRoleMap, *PersonelPermission*
 tables: >-
   View_苗株庫存數量, View_盆花庫存數量, View_盆花規格庫存數量, View_切花出貨一課庫存數量,
   View_YPTransferRecord, View_CFTransferRecord, View_PPTransferRecord,
@@ -46,7 +50,7 @@ tables: >-
 ---
 # PMM 蝴蝶蘭產銷管理系統（source=pmm，DB：RBMS）
 
-> 可查的表以本檔標頭的 `tables:` 為準（IT 可在 `.env` 用 `SQL_PMM_DENY_TABLES` 再擋掉部分表）。
+> 可查的表以本檔標頭的 `tables:` 為準，再扣掉標頭 `deny:` 列的表（IT 還能用 `.env` 的 `SQL_PMM_DENY_TABLES` 再加，但不能減）。
 > 欄位名稱請用 `describe_table` 現查，不要憑印象寫。
 > 標「實測」的數字與結論都在 RBMS 上驗證過；標「業務定義」的是業務單位給的規則，資料庫裡沒有這份對照表。
 
@@ -91,6 +95,11 @@ PMM 同一個詞在不同階段指的是不同資料，問法不夠具體就直�
 - `CF` 切花（Cut Flower）｜`PP` 盆花（Potted Plant）｜`YP` 苗株（Young Plant）｜`SC` 採購與契作
 
 ## 資料表對照
+
+> **人員與權限相關的表不可查**（`BIPersonel`、`BIPersonelProductionLineMap`、`BSRole`、
+> `BSRoleFunctionMap`、`BSPersonalRoleMap`、`View_PersonelPermission`）——屬個資，標頭的
+> `deny:` 已擋下，下 SQL 會被拒絕。有人問「某人有什麼權限」「誰可以操作哪條產線」，
+> 直接說這部分不開放查詢，請向 IT 申請，不要繞路用別的表拼湊。
 **BI 基本主檔**：BIBreed 品種、BIBreedAlias 品種別名、BIColor 花色、BIColorCategory 花色類別、BICustomer 客戶、BIMedium 介質、BIPPPackingCondition 盆花包裝條件、BIPackingColor 包裝顏色、BIPackingSize 包裝大小、BIPersonel 人員帳號、BIPersonelProductionLineMap 人員產線關聯、BIPosition 位置、BIPot 盆器、BIPrintField 列印標貼、BIProcess 製程、BIProductionLine 產線、BIProductionLinePrintFieldMap 產線標貼關聯、BIProductionLineReasonMap 產線移轉原因關聯、BIReason 移轉原因、BIReasonDesc 移轉詳細原因、BIShipPacking 出貨包裝、BIShipPackingMap 出貨包裝入數、BISpec 規格、BISupplier 廠商、BISystemOption 系統選項、BIUploadFile 上傳檔案
 
 **BS／LC**：BSPersonalRoleMap 人員角色對應、BSRole 角色、BSRoleFunctionMap 角色功能權限、LCExecutedSQL 已執行的更新 SQL、LCVersion 資料庫版本
@@ -680,7 +689,7 @@ vs 已出貨數量（CFShipDetail）
 
 ## 關聯重點
 - 單據都是**單頭／單身**：單頭放單號、日期、客戶、狀態；單身放數量與品種／規格／製程／批次參照。
-- 人員權限：`BIPersonel → BSPersonalRoleMap → BSRole → BSRoleFunctionMap`；可操作產線：`BIPersonel → BIPersonelProductionLineMap → BIProductionLine`。直接查 `View_PersonelPermission` 更快。
+- 人員權限與可操作產線（`BIPersonel`、`BSRole*`、`View_PersonelPermission` 這一組）**已擋下不可查**，見上面「資料表對照」的說明。
 - 苗株進貨：`YPPurchase`（進貨）→ `YPProductionBatch`（生產批次）→ `YPPickingPlan`（挑苗排程）。
 - 契作：`SCUnderContract`（批次）→ `SCUnderContractVisit`（訪視）→ `SCUnderContractRecord`。
 

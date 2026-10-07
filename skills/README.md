@@ -16,6 +16,7 @@ description: 使用者詢問印表機安裝、驅動、無法列印時使用   #
 keywords: [印表機, 列印, printer]   # 選填：問題含關鍵字時直接注入本文（較快）
 db: pmm                             # 選填：要查的資料庫代號（見下方「Skill 要查資料庫時」）
 tables: [V_Printer, V_PrintQueue]   # 選填：這個 Skill 需要查的資料表
+deny: [V_PrinterOwner*]             # 選填：這幾張一律不給查（支援 *；見下方「擋表」）
 ---
 （給 AI 看的作法、規則、話術、範例）
 ```
@@ -61,6 +62,7 @@ description: PMM 蝴蝶蘭產銷管理系統（生產批次、庫存、訂單、
 db: pmm                              # 資料庫代號
 tables: >-                           # 這個 Skill 會用到的表
   CFOrder, CFOrderDetail, CFDistribution, BICustomer
+deny: BIPersonel*, *PersonelPermission*   # 這幾張一律不給查（個資）
 ---
 （表的中文意義、關聯、範例查詢 → 會自動併進 sql_query 的工具說明）
 ```
@@ -138,13 +140,30 @@ source: pmm＝PMM 蝴蝶蘭產銷管理系統（生產批次、庫存、訂單�
 | 裝了外來 Skill，不知道要設什麼 | 直接啟動服務，它會印出「要查資料庫 xxx，但沒有連線設定」並指出要複製哪個 `db.json.example` |
 | 同一個資料庫有多個 Skill | `db:` 寫同一個代號即可，表清單自動合併 |
 
+#### 擋表：`deny:`
+
+**該擋的表寫在 Skill 裡，不要只靠 `.env`。** 兩個理由：
+
+- `.env` 少設一行就全開，而且看 `.env` 的人不會知道外來 Skill 裡有哪幾張是個資表。
+- 擋表規則跟著 Skill 走，複製到別的專案時保護不會掉。
+
+寫法支援 glob：`BIPersonel*` 擋掉所有 `BIPersonel` 開頭的、`*PersonelPermission*`
+擋掉名稱含這段的（含 `View_` 前綴的檢視）。只寫 `PersonelPermission` **不會**擋到
+`View_PersonelPermission`——寫了卻沒擋到比沒寫更危險，所以不確定就加 `*`。
+
+`.env` 的 `SQL_<來源>_DENY_TABLES` 仍然有效，而且是**疊加**：IT 可以再擋，不能解除
+Skill 自己宣告的。服務啟動時會印出實際生效的清單。
+
+> 本文也要跟著改。Skill 本文如果還在教模型「人員權限直接查 View_PersonelPermission
+> 更快」，模型就會去撞白名單——被拒絕的查詢不會變成好答案，只會浪費一輪。
+
 ### IT 可以介入的地方（選配，寫在 `.env`）
 
 平常不用設，但這兩個仍然有效：
 
 ```ini
-# 擋表：不論 Skill 宣告了什麼，這裡列的一律不給查（結尾 * 為前綴比對）
-SQL_PMM_DENY_TABLES=BIPersonel,BSPersonalRoleMap,BSRole,BSRoleFunctionMap,PersonelPermission
+# 擋表：疊加在 Skill 的 deny: 之上（支援 glob；只能再擋，不能解除 Skill 擋的）
+SQL_PMM_DENY_TABLES=BIPersonel*,BSRole*,BSPersonalRoleMap,*PersonelPermission*
 
 # 接管：由 IT 統一管理某個資料庫，設了就蓋過 Skill 自己的 db.json
 SQL_SOURCES=pmm
