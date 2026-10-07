@@ -368,10 +368,13 @@ def _vision_text(images, title):
         b64 = base64.b64encode(blob).decode("ascii")
         content.append({"type": "image_url",
                         "image_url": {"url": f"data:image/png;base64,{b64}", "detail": "high"}})
+    # 不送 temperature：新一代模型只接受預設值 1，送了會 400。而這裡的 400 會被
+    # _vision_enrich 的逐頁 except 吃掉，變成「整份文件的圖片內容無聲消失、狀態還是
+    # Done」，比直接失敗難查。輸出本來就只當純文字併回段落（不解析、不驗 schema），
+    # 同一輪的一致性也是靠 _VISION_CACHE 而不是 temperature，拿掉沒有影響。
     res = client.chat.completions.create(
         model=OPENAI_MODEL_VISION,
         messages=[{"role": "user", "content": content}],
-        temperature=0,
     )
     text = (res.choices[0].message.content or "").strip()
     return "" if text in ("（無內容）", "(無內容)") else _scrub_pii(text)
