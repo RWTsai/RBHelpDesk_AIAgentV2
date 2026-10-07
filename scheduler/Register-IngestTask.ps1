@@ -24,7 +24,8 @@ $Cmd = @((Join-Path $here 'run_ingest.cmd'),
        Where-Object { Test-Path $_ } | Select-Object -First 1
 if (-not $Cmd) { Write-Host "找不到 run_ingest.cmd" -ForegroundColor Red; return }
 
-$action  = New-ScheduledTaskAction -Execute $Cmd
+# /q：輸出轉向 logs\ingest_task.log，而且不要 pause（排程執行會卡住）
+$action  = New-ScheduledTaskAction -Execute $Cmd -Argument '/q'
 $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
              -RepetitionInterval (New-TimeSpan -Minutes $Minutes)
 
