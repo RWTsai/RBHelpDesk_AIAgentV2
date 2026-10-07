@@ -731,9 +731,17 @@ def mark_deleting(source_type, source_ref):
         cursor.execute(
             "UPDATE IT_KB_SourceDoc SET Status = 'Deleting', UpdatedAt = SYSUTCDATETIME() "
             "WHERE SourceType = ? AND SourceRef = ? AND Status <> 'Deleting'", (source_type, source_ref))
-        if cursor.rowcount:
-            log_info(f"[ingest] 來源已刪除（{source_type}）：{source_ref}")
+        hit = cursor.rowcount
         conn.commit()
+        if hit:
+            log_info(f"[ingest] 來源已刪除（{source_type}）：{source_ref}")
+            return
+        # 一筆都沒對到。可能是上一輪已經標過（正常），也可能是 SourceRef 根本對不起來
+        # （不正常，而且原本完全不留痕跡——文件會一直留在列表上，狀態還是 Done）。
+        cursor.execute("SELECT COUNT(*) FROM IT_KB_SourceDoc WHERE SourceType = ? AND SourceRef = ?",
+                       (source_type, source_ref))
+        if not cursor.fetchone()[0]:
+            log_error(f"[ingest] 來源回報刪除，但資料庫查無這個 SourceRef（{source_type}）：{source_ref}")
 
 
 def _refs_of(source_type):
@@ -979,21 +987,33 @@ def _onedrive_delta(key, drive_id, root_id, reset=False):
     """
     saved = None if reset else _get_sync_state(key)
     url = saved[6:] if saved and saved.startswith("delta:") else f"/drives/{drive_id}/items/{root_id}/delta"
-    n_items = 0
+    if not url:
+        # 上次把 deltaLink 存成空字串（Graph 那一輪沒回 @odata.deltaLink）。
+        # 不處理的話 while url 直接不跑，之後每一輪都什麼都不做——新增、刪除全部漏掉，
+        # 而且 log 只會印「處理 0 個項目」，看起來像一切正常。
+        log_error(f"[ingest] OneDrive 上次存下來的 deltaLink 是空的（{key}），改做一次完整列舉")
+        url = f"/drives/{drive_id}/items/{root_id}/delta"
+    n_items = n_deleted = 0
     while url:
         data = _graph_get(url).json()
         for item in data.get("value", []):
             n_items += 1
             if "deleted" in item:
+                n_deleted += 1
                 mark_deleting("onedrive", f"{drive_id}:{item['id']}")
             else:
                 _onedrive_upsert(drive_id, item, root_id)
         if "@odata.nextLink" in data:
             url = data["@odata.nextLink"]
         else:
-            _save_sync_state(key, delta_link="delta:" + data.get("@odata.deltaLink", ""))
+            nxt = data.get("@odata.deltaLink", "")
+            if not nxt:
+                log_error(f"[ingest] OneDrive 這一輪沒有回 @odata.deltaLink（{key}），"
+                          f"下一輪會重新完整列舉")
+            _save_sync_state(key, delta_link="delta:" + nxt)
             url = None
-    log_info(f"[ingest] OneDrive delta 同步完成（{key}），處理 {n_items} 個項目")
+    log_info(f"[ingest] OneDrive delta 同步完成（{key}），處理 {n_items} 個項目"
+             f"（其中刪除 {n_deleted}）")
 
 
 def _onedrive_full_list(key, drive_id, root_id):
