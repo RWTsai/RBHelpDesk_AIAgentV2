@@ -108,7 +108,49 @@ python scheduler/ingest_docs.py --doc 12    # 只重跑指定文件
 - 卡在 `Processing` 超過一小時的（程式中途被砍），下一輪啟動時會自動放回 `Pending`。
 - 某個來源同步失敗不影響其他來源，錯誤記在 `IT_KB_SyncState.LastError`。
 
-## 六、Google Drive 怎麼設定
+## 六、排成 Windows 排程（正式環境）
+
+用 `Register-IngestTask.ps1` 註冊，不要手動在工作排程器點（容易漏掉工作目錄、
+執行帳號、單一執行個體這幾個關鍵設定）：
+
+```powershell
+# 以系統管理員身分開啟 PowerShell
+cd D:\...\RBHelpDesk_AIAgent\scheduler
+.\Register-IngestTask.ps1 -RunNow                      # 用目前帳號，每 5 分鐘一輪，註冊完馬上跑一次
+.\Register-IngestTask.ps1 -UserName 'DOMAIN\svc_rbit' -Password 'xxxx'   # 正式環境：專用服務帳號
+.\Register-IngestTask.ps1 -Unregister                  # 移除
+```
+
+它會先驗證那套 Python 有沒有裝齊套件（機器上常有第二套 Anaconda，挑錯會等到
+半夜才失敗），再產生 `run_ingest.cmd` 包裝檔，最後註冊工作。
+
+幾個刻意的選擇：
+
+| 設定 | 為什麼 |
+|---|---|
+| 每 5 分鐘跑 `--once`，而不是常駐 `--loop` | 程序被砍或主機重開，下一輪自動補上；`--once` 開頭會把卡在 `Processing` 的文件放回 `Pending` |
+| 同時只允許一個執行個體（IgnoreNew） | 上一輪還在解析大檔時不會疊第二輪上去 |
+| 工作目錄設成專案根目錄 | `utils/logger.py` 的 `logs/` 是相對路徑，目錄不對 log 就散出去了 |
+| 包一層 `run_ingest.cmd` | 排程器的「動作」不能做輸出轉向，traceback 要留在 `logs\ingest_task.log` |
+| 執行時間上限 2 小時 | 第一次全量匯入可能很久，但不該無限久 |
+
+沒給 `-Password` 時用 S4U（不存密碼）。S4U **存取不到 UNC／網路磁碟**，
+所以 `DOC_DROP_FOLDER` 指向網芳的話一定要給密碼。
+
+看狀況：
+
+```powershell
+Get-ScheduledTask -TaskName RBIT_IngestDocs | Get-ScheduledTaskInfo   # 上次結果、下次時間
+Get-Content .\logs\ingest_task.log -Tail 50 -Wait -Encoding UTF8      # 這一輪的輸出
+Get-Content .\logs\2026-10-07.log -Tail 50 -Encoding UTF8             # 程式自己的日誌
+```
+
+`LastTaskResult` 0 是成功，1 多半是連不到資料庫（`--once` 連不上就直接以非 0 結束，
+刻意讓排程器看得出失敗），267009 代表還在執行中。
+
+---
+
+## 七、Google Drive 怎麼設定
 
 用 service account（服務帳戶）存取，不需要任何人登入授權，適合常駐程式。
 
@@ -174,7 +216,7 @@ GDRIVE_FOLDER_IDS=1A2b3C4dEfGhIjKlMnOpQrStUvWxYz,1ZzYy9Xx8Ww7Vv6Uu5Tt4Ss
 Google 文件／試算表／簡報沒有實體檔案，會自動匯出成 docx／xlsx／pptx 再解析，
 檔名會補上副檔名（例如「請假辦法」→「請假辦法.docx」）。
 
-## 七、OneDrive 的兩種模式
+## 八、OneDrive 的兩種模式
 
 - **delta（預設）**：第一次回傳全部，之後只回傳異動，最省。deltaLink 存在 `IT_KB_SyncState.DeltaLink`（`delta:` 開頭）。
 - **完整列表**：部分 SharePoint／OneDrive for Business 環境的子資料夾不支援 delta，偵測到就自動改用這個模式，把完整清單存起來（`full:` 開頭）下次比對。
