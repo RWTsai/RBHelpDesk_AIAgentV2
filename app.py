@@ -28,7 +28,7 @@ import sys
 
 # 載入 LangGraph 的主流程（你已經建立在 agents/graph_main.py）
 from agents.graph_main import run_graph_for_line_event
-from agents.nodes.utils_line import verify_line_signature
+from agents.nodes.utils_line import verify_line_signature, line_secret_fingerprint
 from config import print_config_status, LINE_VERIFY_SIGNATURE
 from database import doc_graph_client
 
@@ -109,8 +109,17 @@ def line_webhook():
     # 必須在 get_json() 之前讀原始 body（get_data 會快取，之後 get_json 仍可用）。
     if LINE_VERIFY_SIGNATURE:
         raw_body = request.get_data()
-        if not verify_line_signature(raw_body, request.headers.get("X-Line-Signature", "")):
-            print("[Webhook] 簽章驗證失敗，拒絕請求")
+        sig = request.headers.get("X-Line-Signature", "")
+        if not verify_line_signature(raw_body, sig):
+            # 原本只印「驗證失敗」，分不出是沒帶標頭、secret 換錯頻道、還是
+            # 前面的 IIS 反向代理改過 body。這三種的處理方式完全不同。
+            # Content-Length 和實際讀到的長度不一致 → 就是中間層動過 body；
+            # 兩者一致但簽章不符 → secret 是另一個頻道的。
+            print(f"[Webhook] 簽章驗證失敗，拒絕請求（path={request.path} "
+                  f"標頭={'無' if not sig else '有'} "
+                  f"body={len(raw_body)} bytes/Content-Length={request.content_length} "
+                  f"secret指紋={line_secret_fingerprint()} "
+                  f"來源={request.headers.get('X-Forwarded-For') or request.remote_addr}）")
             return "invalid signature", 403
 
     ## 正式接收請求時使用下面這段程式碼

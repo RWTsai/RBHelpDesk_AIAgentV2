@@ -50,6 +50,19 @@ def fetch_line_image_bytes(message_id: str) -> bytes:
         return None
 
 
+def line_secret_fingerprint() -> str:
+    """
+    目前生效的 LINE_CHANNEL_SECRET 的指紋（SHA256 前 8 碼）。
+
+    為什麼需要：正式與開發是兩個不同的 LINE 頻道，各有各的 secret，而 .env 裡
+    一次只能有一組生效。換錯邊時所有請求都會驗不過，但 log 只寫「驗證失敗」，
+    完全看不出是哪一組在用。指紋是單向雜湊，可以安全地印在 log 裡拿來核對。
+    """
+    if not LINE_CHANNEL_SECRET:
+        return "（未設定）"
+    return hashlib.sha256(LINE_CHANNEL_SECRET.encode("utf-8")).hexdigest()[:8]
+
+
 def verify_line_signature(body: bytes, signature: str) -> bool:
     """
     驗證 LINE Webhook 的 X-Line-Signature。
@@ -75,7 +88,16 @@ def verify_line_signature(body: bytes, signature: str) -> bool:
         computed_signature = base64.b64encode(hash_value).decode("utf-8")
 
         # 用 compare_digest 做定時比對，避免字串比對的時間差被用來推測簽章
-        return hmac.compare_digest(computed_signature, signature)
+        if hmac.compare_digest(computed_signature, signature):
+            return True
+
+        # 對不起來。只記兩邊的前綴——簽章本來就在請求標頭裡（不是秘密），
+        # 但這兩個值放在一起就分得出是「secret 不對」還是「body 被中間層改過」：
+        # secret 不對 → 兩邊從第一個字元就不同；body 被改 → 也是全不同，
+        # 所以真正要搭配看的是 secret 指紋（見 line_secret_fingerprint）。
+        log_error(f"verify_line_signature(): 簽章不符 收到={signature[:12]}… "
+                  f"算出={computed_signature[:12]}… body={len(body)} bytes")
+        return False
 
     except Exception as e:
         log_error(f"LINE signature 驗證失敗: {e}")
