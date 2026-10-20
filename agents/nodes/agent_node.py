@@ -39,8 +39,10 @@ from config import (
     OPENAI_STORE_RESPONSES,
     QA_FAST_PATH_MIN_SCORE,
     QA_PREFETCH_MIN_SCORE,
+    DOC_PREFETCH_MIN_SCORE,
     VERIFY_ENABLED,
     VERIFY_EVIDENCE_MAX_CHARS,
+    VERIFY_REASONING_EFFORT,
     SYSROLE_PROMPT,
     SYSTEM_BASE_PROMPT,
     KNOWLEDGE_BASE_PROMPT_CORE,
@@ -60,8 +62,9 @@ from .utils_line import start_loading, push_messages
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# 驗證略過的情況：只用了這些工具（結果本身就是依據）
-_SELF_EVIDENT_TOOLS = {"sql_query", "load_skill"}
+# 驗證略過的情況：只用了這些工具（結果本身就是依據）。describe_table 只是查欄位，
+# 漏列的話「先 describe_table 再 sql_query」的正常查法會被送去驗證，實測被誤判 fail
+_SELF_EVIDENT_TOOLS = {"sql_query", "describe_table", "load_skill"}
 
 # 進度訊息用：工具名稱 -> 講給使用者聽的說法（不要出現工具名或資料表名）
 _TOOL_PHRASE = {
@@ -79,11 +82,32 @@ _SOURCES_RE = re.compile(r"^\s*SOURCES\s*[:：]\s*(.*)$", re.IGNORECASE | re.MUL
 
 
 class VerifyResult(BaseModel):
-    """驗證器的結構化輸出"""
+    """驗證結果（由 _verdict_from_claims 依逐句分類算出，不是模型直接給的）"""
     verdict: Literal["pass", "needs_more", "fail"] = Field(description="判定結果")
     unsupported_claims: List[str] = Field(default_factory=list, description="沒有證據支持的敘述")
     missing_info: str = Field(default="", description="還缺什麼資訊")
     feedback: str = Field(default="", description="給 Agent 的修正建議")
+
+
+class ClaimCheck(BaseModel):
+    claim: str = Field(description="草稿中的一句敘述")
+    # 先回答這個是非題再分類：gpt-6-luna 光看分類說明，還是會把工作管理員、iPhone Wi-Fi 設定
+    # 這類通用操作歸成 internal_fact；問具體的是非題比讓它挑分類穩定
+    company_specific: bool = Field(description="這句話是否只在本公司成立（換到別家公司就不一定對）")
+    kind: Literal["internal_fact", "fixed_phrase", "general_it", "clarification", "paraphrase"]
+    # 放在 supported 前面：先逼它去證據裡找原文，再下判斷
+    quote: str = Field(default="", description="證據中支持這句的原文片段，逐字複製（最多 60 字）；找不到填空字串")
+    supported: bool = Field(description="internal_fact 是否有證據支持；其他分類填 true")
+    severity: Literal["none", "minor", "major"] = Field(
+        description="supported=false 時的嚴重度：major＝使用者照做會出錯；minor＝措辭或細節的輕微延伸；有依據填 none")
+
+
+class VerifyJudgement(BaseModel):
+    """驗證器模型的結構化輸出：只做逐句分類，pass/fail 由程式決定"""
+    claims: List[ClaimCheck] = Field(default_factory=list)
+    answers_question: bool = Field(description="草稿是否回應了使用者的需求（含合理地請使用者補充條件）")
+    missing_info: str = Field(default="", description="還缺什麼資訊")
+    feedback: str = Field(default="", description="建議再查什麼")
 
 
 # =====================================================
@@ -126,16 +150,16 @@ def process_text(state: dict) -> dict:
         _step(trace, "skill_keyword", 0, skills=[s["name"] for s in kw_skills])
 
     reply, sources = None, []
-    qa_hits = []               # 快速路徑查到的 QA 命中；分數不夠時轉給 Agent 迴圈當證據
+    qa_hits, qa_vec = [], None  # 快速路徑查到的 QA 命中與問題向量；分數不夠時轉給 Agent 迴圈預查用
     try:
         # ---------- 1) 快速路徑 ----------
         if AGENT_FAST_PATH:
-            reply, qa_hits = _fast_path(question, history, skill_text, trace)
+            reply, qa_hits, qa_vec = _fast_path(question, history, skill_text, trace)
 
         # ---------- 2) Agent 迴圈 + 3) 驗證 ----------
         if reply is None:
             notify = _progress_notifier(user_id, t0, trace)
-            reply, sources = _agent_loop(question, history, kw_skills, skill_text, trace, qa_hits, notify, t0)
+            reply, sources = _agent_loop(question, history, kw_skills, skill_text, trace, qa_hits, notify, t0, qa_vec)
 
     except Exception as e:
         log_error(f"[AGENT] 執行失敗：{e}")
@@ -204,7 +228,7 @@ def _fast_path(question, history, skill_text, trace):
     _step(trace, "fast_path_check", t, top_score=round(top, 4), threshold=QA_FAST_PATH_MIN_SCORE)
     if top < QA_FAST_PATH_MIN_SCORE:
         # 分數不夠走不了快速路徑，但這批命中已經查好了，交給 Agent 迴圈當預先證據，不要重查
-        return None, hits
+        return None, hits, vec
 
     # 只取夠接近的命中（與 top1 差距 0.1 以內），依 ChunkText 去重
     chunks, triples = [], []
@@ -241,15 +265,15 @@ def _fast_path(question, history, skill_text, trace):
         # 模型沒給內容。回 None 讓它落到 Agent 迴圈，不要把空字串當成有效答案
         # ——reply 節點看到空字串會整則不送，使用者會以為機器人死了。
         log_error("[AGENT] 快速路徑回了空內容，改走 Agent 迴圈")
-        return None, hits
+        return None, hits, vec
     trace["verdict"] = "fast_path"
-    return answer, hits
+    return answer, hits, vec
 
 
 # =====================================================
 # 2) Agent 迴圈
 # =====================================================
-def _agent_loop(question, history, kw_skills, skill_text, trace, qa_hits=(), notify=None, t0=None):
+def _agent_loop(question, history, kw_skills, skill_text, trace, qa_hits=(), notify=None, t0=None, qa_vec=None):
     registry = agent_tools.build_base_tools()
     loaded_skills = {s["name"] for s in kw_skills}
     # 已注入的 skill 若帶工具，直接加進可用工具
@@ -275,25 +299,52 @@ def _agent_loop(question, history, kw_skills, skill_text, trace, qa_hits=(), not
     evidence = {}      # source_id → item（去重後的全部證據）
     tools_used = []    # 依序記錄用過的工具名稱
 
-    # 快速路徑已經查過 QA 知識庫（分數不夠才會走到這裡），把命中結果直接當成證據帶進來：
-    # 向量搜尋已經跑完是免費的，省掉一次 search_qa_kb 往返，也避免模型完全不查就憑自身知識作答
-    prefetch = agent_tools.qa_items(qa_hits, min_score=QA_PREFETCH_MIN_SCORE)
-    if prefetch:
-        for it in prefetch:
+    # 快速路徑已經查過 QA 知識庫（分數不夠才會走到這裡），用同一個向量再查一次文件庫，
+    # 兩邊一起帶進來：向量已經算好，幾乎不花時間，也避免模型完全不查就憑自身知識作答。
+    # 只帶 QA 的時候出過事：0.51 的「題目相近」被當成已查過的證據，模型就不再查文件與資料庫
+    # （正式區 78 題有 14 題一個工具都沒叫，例如問 PMM 越南庫存卻回答盆花配貨系統網址）。
+    pre_qa = agent_tools.qa_items(qa_hits, min_score=QA_PREFETCH_MIN_SCORE)
+    pre_doc = []
+    if qa_vec is not None and DOC_PREFETCH_MIN_SCORE:
+        try:
+            docs = agent_tools.search_documents(question, query_vec=qa_vec)
+            pre_doc = [it for it in docs["items"] if it["score"] >= DOC_PREFETCH_MIN_SCORE]
+        except Exception as e:
+            log_error(f"[AGENT] 文件預查失敗（改由模型自己查）：{e}")
+    if pre_qa or pre_doc:
+        for it in pre_qa + pre_doc:
             evidence[it["source_id"]] = it
-        tools_used.append("search_qa_kb")      # 讓驗證器照樣檢查這批證據
+        # 讓驗證器照樣檢查這批證據
+        if pre_qa:
+            tools_used.append("search_qa_kb")
+        if pre_doc:
+            tools_used.append("search_documents")
+        none = {"ok": True, "items": [], "note": "沒有分數夠高的結果"}
         conv.append({"role": "user", "content": (
-            "[系統訊息，使用者看不到] 已經先幫你查過 QA 知識庫（等同 search_qa_kb），結果如下，"
-            "不要重複呼叫 search_qa_kb：\n"
-            + agent_tools.result_to_text({"ok": True, "items": prefetch})
-            + "\n若這些內容不足以完整回答使用者的問題，請依工具使用規則第 2 條呼叫 search_documents。"
+            "[系統訊息，使用者看不到] 已經先用使用者的原句查過 QA 知識庫與文件庫，結果如下。"
+            "score 是語意相似度：0.7 以上通常切題；0.5～0.7 多半只是用詞相近，"
+            "要自己判斷有沒有真的回答到使用者問的那件事。\n"
+            "【QA 知識庫】\n" + agent_tools.result_to_text({"ok": True, "items": pre_qa} if pre_qa else none)
+            + "\n【文件庫】\n" + agent_tools.result_to_text({"ok": True, "items": pre_doc} if pre_doc else none)
+            + "\n接下來：\n"
+            "- 問題要的是數據（庫存、批次、數量、訂單、出貨、良率、品種清單…）→ 一定要呼叫 sql_query，"
+            "上面的結果不能代替資料庫查詢結果，也不要回答成「去哪個系統查」。\n"
+            "- 作法類問題而上面內容不足 → 換關鍵字再呼叫 search_documents 或 search_qa_kb"
+            "（不要用同一句原句重查）。\n"
+            "- 只有上面的內容確實完整回答了問題，才可以不呼叫工具直接作答。"
         )})
-        _step(trace, "qa_prefetch", 0, items=len(prefetch), top_score=prefetch[0]["score"])
+        _step(trace, "prefetch", 0,
+              qa=len(pre_qa), qa_top=pre_qa[0]["score"] if pre_qa else None,
+              doc=len(pre_doc), doc_top=pre_doc[0]["score"] if pre_doc else None)
 
     steps = 0
     verify_retry = 0
     draft = None
     forced_notice = False      # 強制作答的說明只插一次
+    model_calls = 0            # 模型自己叫的工具次數（預查不算）
+    pre_ids = [it["source_id"] for it in pre_qa + pre_doc]
+    pre_count = len(tools_used)  # tools_used 前面這幾個是預查塞的，不是模型叫的
+    require_tool = False       # 下一輪是否強制呼叫工具
 
     def over_budget():
         """時間是否用完。要能在迴圈各處重新評估，不能只在頂端算一次。"""
@@ -325,7 +376,8 @@ def _agent_loop(question, history, kw_skills, skill_text, trace, qa_hits=(), not
         kwargs = {"model": OPENAI_MODEL_CHAT, "instructions": system, "input": conv}
         if registry:
             kwargs["tools"] = agent_tools.to_responses_tools(registry)
-            kwargs["tool_choice"] = "none" if force_answer else "auto"
+            kwargs["tool_choice"] = "none" if force_answer else ("required" if require_tool else "auto")
+        require_tool = False
         res = _respond(**kwargs)
         calls = [o for o in res.output if o.type == "function_call"]
         _step(trace, "llm", t, round=steps + 1, tool_calls=[c.name for c in calls])
@@ -335,6 +387,7 @@ def _agent_loop(question, history, kw_skills, skill_text, trace, qa_hits=(), not
                 notify([c.name for c in calls])
             # 把這一輪模型自己產生的 output 原封不動接回去（含 reasoning 項目——
             # 少了它們，下一輪的 function_call_output 會對不上它的 function_call）
+            model_calls += len(calls)
             conv += [o.to_dict() for o in res.output]
             for c, out_text in _run_tool_calls(calls, registry, loaded_skills, evidence, tools_used, trace):
                 conv.append({"type": "function_call_output", "call_id": c.call_id, "output": out_text})
@@ -344,13 +397,20 @@ def _agent_loop(question, history, kw_skills, skill_text, trace, qa_hits=(), not
         draft = res.output_text or ""
 
         # ---------- 3) 驗證 ----------
-        if not VERIFY_ENABLED or not tools_used or set(tools_used) <= _SELF_EVIDENT_TOOLS:
+        # 只看模型自己叫的工具：預查一定會塞 search_* 進 tools_used，
+        # 不排除的話「只用 SQL 作答」也會被送去驗證（實測 Luna 驗證器因此把正確的 SQL 結果判 fail）
+        model_tools = tools_used[pre_count:]
+        if not VERIFY_ENABLED or not tools_used or (model_tools and set(model_tools) <= _SELF_EVIDENT_TOOLS):
             # 沒用工具（問安、閒聊、範圍外）或只用 SQL（結果本身即依據）→ 略過驗證
             trace["verdict"] = "pass_skip"
             break
 
         t = time.time()
-        v = _verify(question, evidence, draft)
+        # 預查的證據排最後：驗證器只讀前 VERIFY_EVIDENCE_MAX_CHARS 字，
+        # 預查的 6 段文件排前面會把模型真正查到的結果（SQL 表格）擠出去
+        ev = {k: x for k, x in evidence.items() if k not in pre_ids}
+        ev.update({k: evidence[k] for k in pre_ids if k in evidence})
+        v = _verify(question, ev, draft)
         if v is None:
             # 驗證器壞了（SDK 不相容、API 掛掉…）。不擋回覆，但紀錄要寫實話。
             _step(trace, "verify", t, verdict="error")
@@ -362,13 +422,20 @@ def _agent_loop(question, history, kw_skills, skill_text, trace, qa_hits=(), not
         if v.verdict == "pass":
             break
 
-        if v.verdict == "needs_more" and verify_retry < AGENT_MAX_VERIFY_RETRY and not over_budget():
+        # fail 但模型一個工具都沒叫過（只憑預查作答）也給補查：這種 fail 多半是「沒去查」而不是幻覺，
+        # 直接保守改寫只會回「知識庫查無」（實測 Luna 驗證器常直接判 fail，不判 needs_more）
+        retryable = v.verdict == "needs_more" or (v.verdict == "fail" and model_calls == 0)
+        if retryable and verify_retry < AGENT_MAX_VERIFY_RETRY and not over_budget():
             verify_retry += 1
             steps = min(steps, AGENT_MAX_STEPS - 1)  # 至少再給一輪工具呼叫
+            # 手上只有預查結果、模型一個工具都沒叫過 → 這一輪強制叫工具。
+            # 不強制的話實測它會拿同一批證據換句話再寫一次草稿（TraceID 31 連兩輪 tool_calls 都是空的）。
+            require_tool = model_calls == 0
             conv += [o.to_dict() for o in res.output]
             conv.append({"role": "user", "content": (
                 f"[系統品質檢查回饋，使用者看不到] 草稿還缺少：{v.missing_info or '關鍵資訊'}。"
-                f"建議：{v.feedback}。請再查詢補足後重新回答；若確實查不到，請明確說明查不到的部分。"
+                f"建議：{v.feedback}。請呼叫工具補查後重新回答（要數據用 sql_query，要作法用 search_documents）；"
+                "若確實查不到，請明確說明查不到的部分。"
             )})
             continue
 
@@ -461,15 +528,19 @@ def _verify(question, evidence, draft) -> VerifyResult:
     answer, _ = _split_sources(draft)
 
     try:
-        res = parse_structured(
-            client,
+        res = _call_model(
+            lambda **kw: parse_structured(client, **kw), "chat",
+            lambda v: {"reasoning_effort": v},
+            effort=VERIFY_REASONING_EFFORT,
             model=OPENAI_MODEL_VERIFY,
-            messages=[{"role": "user", "content": VERIFY_PROMPT.format(question=question, evidence=ev_text, draft=answer)}],
-            response_format=VerifyResult,
+            messages=[{"role": "user", "content": VERIFY_PROMPT.format(
+                question=question, evidence=ev_text, draft=answer, rules=_verify_rules(),
+                today=datetime.date.today().isoformat())}],
+            response_format=VerifyJudgement,
         )
         parsed = res.choices[0].message.parsed
         if parsed:
-            return parsed
+            return _verdict_from_claims(parsed, ev_text)
         log_error("[AGENT] 驗證器沒有回傳結構化結果")
     except Exception as e:
         log_error(f"[AGENT] 驗證器失敗：{e}")
@@ -477,6 +548,54 @@ def _verify(question, evidence, draft) -> VerifyResult:
     # 回 None 讓呼叫端把 verdict 記成 verify_error，否則稽核紀錄會顯示
     # 「已驗證通過」，而其實一次都沒驗到。
     return None
+
+
+def _verify_rules():
+    """
+    給驗證器的「系統規則」：回覆規則＋非資料庫 Skill 的本文（密碼重設、權限申請…）。
+    Agent 照這些規則寫出的內容（例如「密碼改完要等 15 分鐘同步」「請耐心等待不要重複留言」）
+    驗證器原本看不到，gpt-6-luna 會判成捏造。資料庫 Skill（db-pmm 約 52KB）不放：
+    它的內容只出現在 SQL 題，而只用 SQL 的回覆本來就略過驗證。
+    """
+    parts = [KNOWLEDGE_BASE_PROMPT_CORE.strip()]
+    for sk in skill_loader.get_skills().values():
+        if skill_loader.skill_db_source(sk) or sk["name"] == skill_loader.RESERVED_DB_SKILL:
+            continue
+        parts.append(f"【Skill：{sk['name']}】\n{sk['body']}")
+    return "\n\n".join(parts)
+
+
+def _squash(text):
+    """比對引用原文用：去掉所有空白與常見標點差異"""
+    return re.sub(r"[\s　、，,。．.：:；;「」『』（）()\[\]【】\-–—*`|>›]+", "", text or "").lower()
+
+
+def _verdict_from_claims(j: VerifyJudgement, ev_text: str = "") -> VerifyResult:
+    """
+    逐句分類 → 判定。只有「內部事實沒有證據、而且是 major」才算 fail；固定話術、一般常識、
+    請使用者補資料、改寫都不算。沒有回應到問題 → needs_more（再查一次可能補足）。
+
+    模型抄得出來、而且真的出現在證據裡的原文 → 一律算有依據。實測 gpt-6-luna 會漏看證據
+    （白名單網址、aka.ms 連結明明在證據裡卻判沒有），要它先引用、再由程式比對，比讓它自己判穩。
+    """
+    ev = _squash(ev_text + _verify_rules())
+    for c in j.claims:
+        q = _squash(c.quote)
+        if c.kind == "internal_fact" and not c.supported and len(q) >= 4 and q in ev:
+            c.supported, c.severity = True, "none"
+    # 只看 major：實測 gpt-6-luna 會把「可勾選」「立即」這種措辭延伸也標成沒依據，
+    # 11 句裡 1 句輕微延伸就整題 fail 的話，39 題有 33 題被打回（4o-mini 只有 0 題）
+    bad = [c.claim for c in j.claims
+           if c.kind == "internal_fact" and c.company_specific and not c.supported and c.severity == "major"]
+    if bad:
+        verdict = "fail"
+    elif not j.answers_question:
+        verdict = "needs_more"
+    else:
+        verdict = "pass"
+    return VerifyResult(verdict=verdict, unsupported_claims=bad,
+                        missing_info=j.missing_info if verdict != "pass" else "",
+                        feedback=j.feedback if verdict != "pass" else "")
 
 
 def _conservative_rewrite(system, conv, draft, v, trace):
@@ -532,15 +651,18 @@ def _call_model(create, api, effort_param, **kwargs):
                    Chat Completions → {"reasoning_effort": "low"}
                    Responses        → {"reasoning": {"effort": "low"}}
     """
+    effort = kwargs.pop("effort", None)
+    if effort is None:
+        effort = AGENT_REASONING_EFFORT                # 沒指定就用 Agent 的設定（驗證器另外指定）
     model = kwargs.get("model")
     key = (api, model, bool(kwargs.get("tools")))   # 限制常常只在「帶工具」時才出現
-    start = _REASONING_MODE.get(key, "effort" if AGENT_REASONING_EFFORT else "omit")
+    start = _REASONING_MODE.get(key, "effort" if effort else "omit")
 
     last, errors = None, []
     for mode in _REASONING_ORDER[start]:
         extra = {}
         if mode == "effort":
-            extra = effort_param(AGENT_REASONING_EFFORT)
+            extra = effort_param(effort)
         elif mode == "none":
             extra = effort_param("none")
         try:

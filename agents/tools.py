@@ -126,8 +126,9 @@ def qa_items(rows, min_score: float = 0.0, top_k: int = None) -> list:
 # =====================================================
 # 2) 文件 GraphRAG
 # =====================================================
-def search_documents(query: str) -> dict:
-    res = doc_graph_client.local_search(query)
+def search_documents(query: str, query_vec=None) -> dict:
+    """query_vec：已經算好的向量（agent_node 預查用，省一次 embedding）；模型呼叫時不會給"""
+    res = doc_graph_client.local_search(query, query_vec=query_vec)
     items = []
     for c in res["chunks"]:
         items.append({

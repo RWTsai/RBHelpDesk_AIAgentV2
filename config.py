@@ -64,11 +64,11 @@ def _env_list(key, default=""):
 # --- OpenAI 模型 ---
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL_EMBED = _env_str("OPENAI_MODEL_EMBED", "text-embedding-3-small")
-OPENAI_MODEL_CHAT = _env_str("OPENAI_MODEL_CHAT", "gpt-5.1")          # Agent 主控（規劃＋回覆）
+OPENAI_MODEL_CHAT = _env_str("OPENAI_MODEL_CHAT", "gpt-6.1-sol")          # Agent 主控（規劃＋回覆）
 OPENAI_MODEL_FAST = _env_str("OPENAI_MODEL_FAST", OPENAI_MODEL_CHAT)  # 快速路徑，空值＝沿用 CHAT
-OPENAI_MODEL_VERIFY = _env_str("OPENAI_MODEL_VERIFY", "gpt-4o-mini")  # 答案驗證
-OPENAI_MODEL_EXTRACT = _env_str("OPENAI_MODEL_EXTRACT", "gpt-4o")     # 三元組／實體關係抽取
-OPENAI_MODEL_VISION = _env_str("OPENAI_MODEL_VISION", "gpt-4o")       # 圖片分析
+OPENAI_MODEL_VERIFY = _env_str("OPENAI_MODEL_VERIFY", "gpt-6-luna")  # 答案驗證
+OPENAI_MODEL_EXTRACT = _env_str("OPENAI_MODEL_EXTRACT", "gpt-6-luna") # 三元組／實體關係抽取
+OPENAI_MODEL_VISION = _env_str("OPENAI_MODEL_VISION", "gpt-6-luna") # 圖片分析
 AGENT_REASONING_EFFORT = _env_str("AGENT_REASONING_EFFORT", "low")    # 推理強度，空值＝不帶此參數
 
 # Agent 迴圈走 Responses API（新模型的 tool calling 只支援這個 API）。
@@ -98,10 +98,18 @@ AGENT_TIME_BUDGET_SEC = _env_float("AGENT_TIME_BUDGET_SEC", 40.0)
 QA_FAST_PATH_MIN_SCORE = _env_float("QA_FAST_PATH_MIN_SCORE", 0.80)
 # 快速路徑分數不夠時，這批 QA 命中仍當成「已查過」的證據帶進 Agent 迴圈；
 # 低於此分數視為雜訊不帶入（例如問安），設 0 則一律帶入
-QA_PREFETCH_MIN_SCORE = _env_float("QA_PREFETCH_MIN_SCORE", 0.50)
+QA_PREFETCH_MIN_SCORE = _env_float("QA_PREFETCH_MIN_SCORE", 0.60)
+# 文件也一起預查（同一個向量，幾乎不花時間），讓模型比較 QA 與文件哪邊比較貼題。
+# 為什麼：原本只帶 QA，0.51 的「題目相近」被當成已查過的證據，模型就不再查文件與資料庫
+# （正式區 78 題中 14 題一個工具都沒叫）。設 0 關閉文件預查。
+DOC_PREFETCH_MIN_SCORE = _env_float("DOC_PREFETCH_MIN_SCORE", 0.50)
+# QA 去重：與已選 QA 的向量相似度 ≥ 此值視為同一題的換句話說（實測同義問法 0.85～0.98），0＝不去重
+QA_DEDUP_SIM = _env_float("QA_DEDUP_SIM", 0.90)
 QA_TRIPLE_EXPAND = _env_bool("QA_TRIPLE_EXPAND", True)        # search_qa_kb 是否先做三元組擴展
 VERIFY_ENABLED = _env_bool("VERIFY_ENABLED", True)
 VERIFY_EVIDENCE_MAX_CHARS = _env_int("VERIFY_EVIDENCE_MAX_CHARS", 12000)
+# 驗證器的推理強度。新一代模型預設 medium；實測 gpt-6-luna 用 none 準確度最好也最快（中位數 6.8 秒，low 10.8 秒）；空＝不帶參數
+VERIFY_REASONING_EFFORT = _env_str("VERIFY_REASONING_EFFORT", "none")
 
 # --- 檢索 ---
 RAG_QA_TOP_K = _env_int("RAG_QA_TOP_K", 5)
@@ -382,11 +390,20 @@ AGENT_SYSTEM_PROMPT = """
    - 只查到結論或名詞解釋，缺少使用者要的操作步驟、畫面位置、設定值
    - 使用者問的是某個系統的操作方式、設定或流程（這類完整說明通常在手冊、簡報裡，QA 知識庫往往只有摘要）
    反之，QA 知識庫已經完整回答了問題，就不必再查文件。
+   **例外：問題要的是「數據」而不是「作法」時，直接用 sql_query，不必先繞 search_documents**——
+   這類答案在資料庫裡，文件庫只會查到無關的東西（見規則 4）。
 3. 內部查不到，或明顯需要外部、最新資訊（例如軟體版本、公開的錯誤碼說明）時，才用 web_search；回答時要說明資訊來自網路。
-4. 需要即時資料（例如帳號狀態）時用 sql_query；只能寫單一 SELECT，只能查工具說明中列出的表。
+4. **問題要的是資料庫裡的數據時用 sql_query**：庫存量、訂單、批次、生產與移轉數量、良率、品種與花色、規格、異動原因、客戶、人員權限、帳號狀態等等——
+   只要使用者問的是「多少／哪些／什麼時候／能不能滿足」這類具體數字或清單，就是資料庫的事，不要拿文件庫的搜尋結果來回答。
+   sql_query 的工具說明裡列出可查的表，以及該資料庫的業務規則（哪張表才對、欄位陷阱、必須先問清楚的條件），**寫 SQL 前先讀完那段說明**，不要憑表名猜。
+   只能寫單一 SELECT，只能查工具說明中列出的表。查出來是空的先懷疑表選錯或條件太窄，必要時用 describe_table 確認欄位，不要馬上說查不到。
+   **條件沒講清楚但有合理預設時，先照預設查出結果**，在回答開頭用一句話說明採用的假設（例如「以下為越南三條產線的苗株庫存」），
+   最後再問要不要改條件。只有 sql_query 說明裡明列「必須先問」的情況（例如良率的起算點、栽培時間的起算點）才先問、不查。
+   使用者已經講明的條件（例如已說「盆花」）不要再反問。
 5. 同樣的查詢不要重複呼叫；證據足夠就停止查詢並作答。問安、閒聊、範圍外的問題不需要呼叫工具。
 6. 問題符合下方某個 Skill 的描述時，先呼叫 load_skill 取得作法再處理（已直接提供內容的 Skill 不必再載入）。
 7. 公司內部系統、流程、帳號的資訊只能依據工具取得的證據，不得捏造；一般 IT 常識可以用你自己的知識補充。
+   **說「查無」之前先確認該查的地方都查過了**：問數據的要查過 sql_query，問作法的要查過 search_documents。只查了其中一種就說查不到，是錯的。
 8. 使用者不是用繁體中文發問時，查詢時先轉成繁體中文關鍵字，回答時用使用者的語言。
 
 【引用來源】
@@ -419,18 +436,54 @@ FAST_PATH_PROMPT = """{system_base}
 
 請開始你的回答："""
 
-# 驗證器
-VERIFY_PROMPT = """你是 IT 客服回覆的品質檢查員。請檢查「草稿答案」是否可以直接回覆給使用者。
+# 驗證器：逐句分類，最後判定由程式依分類決定（agent_node._verdict_from_claims）。
+# 為什麼不讓模型直接判 pass/fail：新一代模型（gpt-6-luna）非常字面，整體判斷時只要有一句話
+# 在證據裡找不到原文就判 fail——連「請輸入真人客服」這種系統規定的話術、「APP」改寫成
+# 「驗證 APP」都算。改成只要它做分類（字面的模型分類很穩），嚴不嚴格由程式規則決定。
+VERIFY_PROMPT = """你是 IT 客服回覆的品質檢查員。請把「草稿答案」拆成一句一句的敘述，逐句分類並檢查證據。
 
-【檢查項目】
-1. 草稿中關於公司內部系統、流程、帳號、網址、聯絡方式等內部資訊，是否都能在「證據」中找到依據（一般 IT 常識不需要證據）。
-2. 是否確實回答了使用者的問題。
-3. 是否符合回覆規則（分點清楚、不捏造）。
+【company_specific】每一句先回答：這句話是不是只在本公司才成立？
+- 本公司的網址、系統名稱與選單、表單、規定、流程、產線、人員 → true
+- Windows、Office、瀏覽器、iPhone／Android、Teams 等通用軟體的操作與常識，換到任何公司都一樣 → false
 
-【判定】
-- pass：可以直接回覆。
-- needs_more：方向正確，但缺少關鍵資訊，再查一次可能補足（請在 feedback 寫出建議查什麼）。
-- fail：草稿含有沒有證據支持的內部資訊，或證據明顯不足以回答。
+【分類 kind】
+- internal_fact：公司內部的具體事實——網址、系統或功能名稱、操作步驟與畫面位置、設定值、數字或統計結果、
+  資料表與欄位、產線或代號對應、人名、聯絡方式、公司規定或流程。
+- fixed_phrase：系統規定的固定話術——請使用者留言或輸入「真人客服」、會記錄問題並轉交／指派專人、
+  請至電子表單系統填寫「資訊服務需求申請單」、自助密碼重設網址 https://pass.royalbase.com。
+- general_it：不限於本公司的一般 IT 常識，包含 Windows、Office、瀏覽器、手機等通用軟體的標準操作與判斷方式——
+  例如重新開機、清空資源回收筒、磁碟清理、工作管理員看 CPU／記憶體、Windows 日期時間同步、
+  密碼打錯太多次會被鎖、Authenticator 的通用原理。只要換一家公司也成立，就是 general_it。
+- clarification：說明自己做不到的事、請使用者補充資訊、確認條件、提醒查詢範圍或資料限制、說明補上條件後會怎麼查。
+  請使用者選擇條件時列出的選項（例如要查哪幾條產線、哪種庫存、什麼單位）**整段**都屬於這類，不要拆成 internal_fact——
+  選項列錯使用者會更正。
+- paraphrase：把證據內容換句話說、歸納、加上合理的主詞或說明。
+
+【系統規則】下面「系統規則」區塊是助理必須遵守的回覆規則與處理規則，**等同證據**：草稿照這些規則寫出的內容
+（固定話術、密碼重設網址與同步時間、權限申請方式等）都算有依據。
+
+【quote】每一句 internal_fact 都要先到「系統規則」與「證據」裡找支持它的原文，**逐字複製**一小段（最多 60 字，例如網址、選單路徑、關鍵句）；
+證據裡真的找不到才填空字串。其他分類填空字串。找的時候要看完全部證據，包含文件標題與 [圖片內容]。
+
+【supported】只針對 internal_fact 判斷：證據裡有這件事（不必逐字相同，意思相符即可；文件標題、圖片轉錄內容也算證據）→ true；
+證據裡沒有、或與證據矛盾 → false。其他分類一律填 true。
+
+【severity】supported=false 的句子要評嚴重度，其他一律填 none：
+- major：捏造或與證據矛盾的網址、系統或功能名稱、操作步驟或選單路徑、設定值、數字、聯絡方式、公司規定——使用者照做會出錯或被誤導。
+- minor：措辭或細節的輕微延伸（例如證據說「選擇」寫成「勾選」、補一句合理的結果說明），不影響使用者照做。
+資料庫查詢結果（SQL 表格、資料表欄位清單）也是證據：草稿依查詢結果寫出的數字、表名、欄位、查詢條件都算有依據。
+
+【其他欄位】
+- answers_question：草稿是否回應了使用者的需求。直接給答案、或合理地請使用者補充必要條件，都算 true；
+  答非所問、只給無關內容，才是 false。
+- missing_info／feedback：answers_question 為 false 或有 internal_fact 沒依據時，寫出還缺什麼、建議再查什麼
+  （要數據建議查資料庫，要作法建議查文件）。
+- 只列有實質內容的敘述，客套話、標題不用列；最多列 12 句。
+
+今天日期：{today}
+
+【系統規則】
+{rules}
 
 【使用者問題】
 {question}

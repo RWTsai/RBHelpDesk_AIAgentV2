@@ -33,6 +33,7 @@ from config import (
     RAG_ENTITY_TOP_K,
     RAG_MIN_SCORE,
     RAG_CACHE_REFRESH_SEC,
+    QA_DEDUP_SIM,
 )
 from utils.logger import log_info, log_error
 
@@ -292,11 +293,36 @@ def _top_k(mat, q, k, min_score):
 # 1) QA 知識庫語意查詢
 # ================================
 def search_qa_by_vector(query_vec, top_k=None, min_score=0.0):
-    """回傳格式與舊版 search_by_embedding 相同（多一個 similarity）"""
+    """
+    回傳格式與舊版 search_by_embedding 相同（多一個 similarity）。
+
+    top_k 算的是「幾筆不同的 QA」，不是幾列：
+    - 一筆 QA 依三元組拆成多列（實測 5052 列只有 1016 筆 QA），向量幾乎相同，
+      照列數取前 5 常常 5 列都是同一筆 QA。同一筆 QA 的列全部保留（三元組要合併用）。
+    - 同一個答案的不同問法（「盆花配貨系統網址？」「庫存查詢系統在哪？」…）彼此相似度
+      0.85～0.98，會把前幾名整個佔滿。與已選 QA 的相似度 ≥ QA_DEDUP_SIM 就略過，
+      名額讓給其他內容。實測問「PMM 越南庫存」時前 8 名都是同一個網址的換句話說。
+    """
     ensure_cache()
     q = _normalize_query(query_vec)
-    hits = _top_k(_CACHE["qa_mat"], q, top_k or RAG_QA_TOP_K, min_score)
-    return [dict(_CACHE["qa_rows"][i], similarity=s) for i, s in hits]
+    top_k = top_k or RAG_QA_TOP_K
+    mat = _CACHE["qa_mat"]
+    # 多抓一些候選（每筆 QA 約 5 列、同義問法可多達十幾筆），扣掉重複後才湊得滿 top_k
+    hits = _top_k(mat, q, top_k * 20, min_score)
+
+    out, kept, kept_text = [], [], set()
+    for i, s in hits:
+        row = _CACHE["qa_rows"][i]
+        text = row["ChunkText"]
+        if text not in kept_text:
+            if len(kept) >= top_k:
+                continue
+            if QA_DEDUP_SIM and kept and float(np.max(mat[kept] @ mat[i])) >= QA_DEDUP_SIM:
+                continue
+            kept.append(i)
+            kept_text.add(text)
+        out.append(dict(row, similarity=s))
+    return out
 
 
 # ================================
